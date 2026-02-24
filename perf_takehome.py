@@ -55,6 +55,26 @@ from problem import (
 VIRTUAL_BASE: int = 100_000
 ENABLE_DEPTH_3_VSELECT: bool = True
 ENABLE_DEPTH_4_VSELECT: bool = True
+# Optional explicit vselect group masks. When set (non-empty), these masks
+# override the heuristic predicates for the corresponding depth.
+DEPTH_3_VSELECT_GROUPS_OVERRIDE: set[int] = set()
+DEPTH_4_VSELECT_GROUPS_OVERRIDE: set[int] = set()
+# Optional round-specific overrides for depth-3/depth-4 vselect masks.
+# When a round key is present, that set is used for the matching round only.
+DEPTH_3_VSELECT_GROUPS_BY_ROUND: dict[int, set[int]] = {}
+DEPTH_4_VSELECT_GROUPS_BY_ROUND: dict[int, set[int]] = {}
+# Number of pairwise depth-3 leaves lowered via multiply_add in vselect tree.
+# Remaining leaves use flow/vselect directly.
+DEPTH_3_VSELECT_DIFF_PAIRS: int = 3
+# Number of pairwise depth-4 leaves lowered via multiply_add in vselect tree.
+# Remaining leaves use flow/vselect directly.
+DEPTH_4_VSELECT_DIFF_PAIRS: int = 2
+# Experimental depth-5 path: replace scatter loads with a vselect tree for
+# selected groups only. Empty set keeps baseline scatter behavior.
+DEPTH_5_VSELECT_GROUPS: set[int] = set()
+# Number of even/odd depth-5 pairs to lower via multiply_add leaves.
+# 0 means all depth-5 leaves are flow/vselect.
+DEPTH_5_VSELECT_DIFF_PAIRS: int = 0
 
 # When True, reverse bit order in vselect tree: use earliest bit (bit0)
 # for leaf multiply_add, allowing tree computation to start before later
@@ -62,7 +82,19 @@ ENABLE_DEPTH_4_VSELECT: bool = True
 REVERSE_TREE_BIT_ORDER_DEPTH_2: bool = True
 REVERSE_TREE_BIT_ORDER_DEPTH_3: bool = False
 REVERSE_TREE_BIT_ORDER_DEPTH_4: bool = False
+REVERSE_TREE_BIT_ORDER_DEPTH_5: bool = False
+# Experimental: fuse stage-5 constant XOR into the next round's tree XOR.
+# Non-final rounds compute stage5 as `a ^ (a >> 16)` (without const),
+# and rounds r>=1 compensate during tree selection/load.
+ENABLE_STAGE5_TREE_FUSION: bool = False
+# Optional explicit round set for stage-5 const skipping when fusion is enabled.
+# Empty set keeps legacy behavior (skip stage-5 const on all non-final rounds).
+STAGE5_FUSION_SKIP_ROUNDS: set[int] = set()
 MAX_CONCURRENT_GROUPS: int = 20
+# Optional logical emission ordering for groups.
+# The logical group id controls strategy masks and interleave gating.
+# Physical group id controls memory address/store location.
+GROUP_EMIT_ORDER_MODE: Literal["identity", "light_first", "heavy_first"] = "identity"
 # Round-aware interleaving gate for deep tree rounds.
 # These depths are load-heavy due to scatter path, so we cap their in-flight
 # groups independently from the global group window.
@@ -91,13 +123,28 @@ LATE_SCHEDULE_THRESHOLD = 300
 # non-offloadable ops like multiply_add. When False, prefer VALU when it
 # has room and only offload to ALU when VALU is full.
 PROACTIVE_VALU_OFFLOAD: bool = True
+# Only proactively offload VALU ops with priority <= cutoff when enabled.
+# Engine-full fallback offload remains active regardless.
+CRITICALITY_AWARE_OFFLOAD: bool = False
+PROACTIVE_OFFLOAD_PRIORITY_CUTOFF: float = 100.0
 # When True, offloadable VALU ops may be deferred briefly so they can be
 # decomposed to ALU ops in a later cycle instead of consuming VALU slots now.
 DEFER_OFFLOADABLE_VALU: bool = False
 MAX_OFFLOAD_DEFER_CYCLES: int = 2
+# Keep scatter vector-xor combines on VALU when enabled.
+DISABLE_OFFLOAD_SCATTER_VEC_XOR: bool = False
 # Prefer emitting non-zero consts on flow/add_imm when possible to relieve
 # load-engine pressure (using the mapped zero constant as base).
 PREFER_FLOW_CONST: bool = False
+# Experimental: in scatter path, load all 8 node values into a vector and
+# combine with one vector XOR instead of 8 scalar ALU XORs.
+SCATTER_VECTOR_XOR: bool = False
+# Optional filters for SCATTER_VECTOR_XOR. Empty means "all".
+SCATTER_VECTOR_XOR_DEPTHS: set[int] = set()
+SCATTER_VECTOR_XOR_GROUPS: set[int] = set()
+# Engine choice for scalar constant materialization (except zero).
+# `flow` emits constants via add_imm from zero, reducing load pressure.
+CONST_NONZERO_ENGINE: Literal["load", "flow"] = "load"
 
 # Priority calculation scales
 CRITICAL_PATH_SCALE = 100.0
@@ -129,14 +176,27 @@ class Ref:
         return dataclasses.replace(self, offset=offset)
 
 
-def use_vselect_at_depth_3(g: int) -> bool:
+def use_vselect_at_depth_3(g: int, rnd: int | None = None) -> bool:
     """Which groups use vselect at depth 3 (vs scatter loads)."""
+    if rnd is not None and rnd in DEPTH_3_VSELECT_GROUPS_BY_ROUND:
+        return g in DEPTH_3_VSELECT_GROUPS_BY_ROUND[rnd]
+    if DEPTH_3_VSELECT_GROUPS_OVERRIDE:
+        return g in DEPTH_3_VSELECT_GROUPS_OVERRIDE
     return g % 3 != 2 or g > 26 or g == 14
 
 
-def use_vselect_at_depth_4(g: int) -> bool:
+def use_vselect_at_depth_4(g: int, rnd: int | None = None) -> bool:
     """Which groups use vselect at depth 4 (vs scatter loads)."""
+    if rnd is not None and rnd in DEPTH_4_VSELECT_GROUPS_BY_ROUND:
+        return g in DEPTH_4_VSELECT_GROUPS_BY_ROUND[rnd]
+    if DEPTH_4_VSELECT_GROUPS_OVERRIDE:
+        return g in DEPTH_4_VSELECT_GROUPS_OVERRIDE
     return g in {0, 1, 3, 11, 12, 15, 18, 21, 22, 24, 25, 27, 30}
+
+
+def use_vselect_at_depth_5(g: int) -> bool:
+    """Which groups use vselect at depth 5 (vs scatter loads)."""
+    return g in DEPTH_5_VSELECT_GROUPS
 
 
 def _bit_reverse_permute(sources: list, n_bits: int) -> list:
@@ -154,6 +214,20 @@ def _bit_reverse_permute(sources: list, n_bits: int) -> list:
             if i & (1 << b):
                 rev |= 1 << (n_bits - 1 - b)
         result[i] = sources[rev]
+    return result
+
+
+def _bit_complement_permute(sources: list, n_bits: int) -> list:
+    """Apply bit-complement permutation to 2^n_bits source list.
+
+    Output index i receives source (~i) within the n-bit domain.
+    """
+    n = 1 << n_bits
+    assert len(sources) == n
+    result = [None] * n
+    mask = n - 1
+    for i in range(n):
+        result[i] = sources[(~i) & mask]
     return result
 
 
@@ -746,6 +820,8 @@ class Scheduler:
         """Check if a VALU op can be decomposed into scalar ALU ops."""
         if op.engine != "valu":
             return False
+        if DISABLE_OFFLOAD_SCATTER_VEC_XOR and "_scat_xor_vec" in op.id:
+            return False
         match op.slot:
             case ValuBroadcastSlot():
                 return True
@@ -830,24 +906,24 @@ class Scheduler:
         slot_counts: dict[str, int],
         result: list[dict],
         result_cycles: list[int],
-    ) -> bool:
+    ) -> int | None:
         """
         Try to split an offloadable VALU op across past + current
         cycles using spare ALU slots.
         """
         if not self._is_alu_offloadable(op):
-            return False
+            return None
 
         ALU_LIMIT = SLOT_LIMITS["alu"]
         V = self.V
 
-        candidates: list[tuple[dict, int]] = []
+        candidates: list[tuple[dict, int, int]] = []
         total_free = 0
         n_past = 0
 
         cur_free = ALU_LIMIT - slot_counts.get("alu", 0)
         if cur_free > 0:
-            candidates.append((bundle, cur_free))
+            candidates.append((bundle, cur_free, cycle))
             total_free += cur_free
 
         for k in range(1, len(result) + 1):
@@ -855,23 +931,24 @@ class Scheduler:
                 break
             n_past = k
             past = result[-k]
+            past_cycle = result_cycles[-k]
             past_free = ALU_LIMIT - len(past.get("alu", []))
             if past_free > 0:
-                candidates.append((past, past_free))
+                candidates.append((past, past_free, past_cycle))
                 total_free += past_free
             if total_free >= V:
                 break
 
         if total_free < V:
-            return False
+            return None
 
         candidates.reverse()
 
-        plan: list[tuple[dict, int]] = []
+        plan: list[tuple[dict, int, int]] = []
         remaining = V
-        for bndl, free in candidates:
+        for bndl, free, bcycle in candidates:
             take = min(free, remaining)
-            plan.append((bndl, take))
+            plan.append((bndl, take, bcycle))
             remaining -= take
             if remaining == 0:
                 break
@@ -880,19 +957,22 @@ class Scheduler:
         if n_past > 0:
             used = self._collect_bundle_addrs(result[-n_past:])
             if not self._alloc_safe_vector(op, used):
-                return False
+                return None
         else:
             self.allocator.alloc_for_op(op)
 
         all_alu = self._make_alu_ops(self.allocator.rewrite_slot(op.slot))
         offset = 0
-        for bndl, count in plan:
+        completion_cycle = -1
+        for bndl, count, bcycle in plan:
             bndl.setdefault("alu", []).extend(all_alu[offset:offset + count])
             if bndl is bundle:
                 slot_counts["alu"] = slot_counts.get("alu", 0) + count
             offset += count
+            completion_cycle = max(completion_cycle, bcycle)
 
-        return True
+        assert completion_cycle >= 0
+        return completion_cycle
 
     def run(self) -> list[dict]:
         if self.n == 0:
@@ -920,6 +1000,7 @@ class Scheduler:
             bundle: dict[str, list[tuple]] = {}
             slot_counts: dict[str, int] = defaultdict(int)
             scheduled: list[int] = []
+            completion_cycle_override: dict[int, int] = {}
             deferred: list[tuple[float, int, int]] = []
             ready_start = len(ready)
             defer_reasons: dict[str, int] = (
@@ -978,9 +1059,11 @@ class Scheduler:
 
                 if slot_counts[engine] >= SLOT_LIMITS.get(engine, 0):
                     if engine == "valu" and self._is_alu_offloadable(op):
-                        if self._try_split_alu_offload(
+                        completion_cycle = self._try_split_alu_offload(
                                 op, earliest[idx], cycle, bundle,
-                                slot_counts, result, result_cycles):
+                                slot_counts, result, result_cycles)
+                        if completion_cycle is not None:
+                            completion_cycle_override[idx] = completion_cycle
                             scheduled.append(idx)
                             continue
                         defer_item((neg_pri, order, idx), "valu_full_offload_failed")
@@ -998,12 +1081,20 @@ class Scheduler:
                     defer_item((neg_pri, order, idx), f"{engine}_full")
                     continue
 
-                if (PROACTIVE_VALU_OFFLOAD
+                allow_proactive_offload = PROACTIVE_VALU_OFFLOAD
+                if (allow_proactive_offload and CRITICALITY_AWARE_OFFLOAD):
+                    allow_proactive_offload = (
+                        self.priority[idx] <= PROACTIVE_OFFLOAD_PRIORITY_CUTOFF
+                    )
+
+                if (allow_proactive_offload
                         and engine == "valu"
                         and self._is_alu_offloadable(op)):
-                    if self._try_split_alu_offload(
+                    completion_cycle = self._try_split_alu_offload(
                             op, earliest[idx], cycle, bundle,
-                            slot_counts, result, result_cycles):
+                            slot_counts, result, result_cycles)
+                    if completion_cycle is not None:
+                        completion_cycle_override[idx] = completion_cycle
                         scheduled.append(idx)
                         continue
                     if (DEFER_OFFLOADABLE_VALU
@@ -1028,8 +1119,9 @@ class Scheduler:
 
             done_set.update(scheduled)
             for idx in scheduled:
+                completion_cycle = completion_cycle_override.get(idx, cycle)
                 for s in self.successors[idx]:
-                    earliest[s] = max(earliest[s], cycle + 1)
+                    earliest[s] = max(earliest[s], completion_cycle + 1)
                     unsatisfied[s] -= 1
                     if unsatisfied[s] == 0:
                         heapq.heappush(ready, (-self.priority[s], s, s))
@@ -1092,14 +1184,25 @@ class SetupRefs:
     group_offset: dict[int, Ref]
     inp_values_ptr: Ref
     tree_root_vec: Ref
+    tree_root_vec_xor5: Ref | None
     tree_d1_left_vec: Ref
     tree_d1_right_vec: Ref
+    tree_d1_left_vec_xor5: Ref | None
+    tree_d1_right_vec_xor5: Ref | None
     tree_d2_vec: dict[int, Ref]
+    tree_d2_vec_xor5_inv: dict[int, Ref]
     tree_d2_diff: dict[int, Ref]
     tree_d3_vec: dict[int, Ref]
     tree_d3_diff: dict[int, Ref]
+    tree_d3_vec_xor5_inv: dict[int, Ref]
+    tree_d3_diff_xor5_inv: dict[int, Ref]
     tree_d4_vec: dict[int, Ref]
     tree_d4_diff: dict[int, Ref]
+    tree_d4_vec_xor5_inv: dict[int, Ref]
+    tree_d4_diff_xor5_inv: dict[int, Ref]
+    tree_d5_vec: dict[int, Ref]
+    tree_d5_diff: dict[int, Ref]
+    tree_mirror_base_vec: dict[int, Ref]
     hash_const1_vec: dict[int, Ref]
     hash_const3_vec: dict[int, Ref]
     hash_mult_vec: dict[int, Ref]
@@ -1115,7 +1218,7 @@ class TreeState:
     """Mutable tree-traversal state threaded through rounds."""
     index: Ref | None = None
     bits: list[Ref | None] = dataclasses.field(
-        default_factory=lambda: [None, None, None, None])
+        default_factory=lambda: [None, None, None, None, None])
 
     def set_bit(self, depth: int, ref: Ref) -> None:
         """Record the branch bit for the given depth."""
@@ -1150,8 +1253,15 @@ class KernelBuilder:
             self.virt_ptr += 1
             self.vid_to_vaddr[vid] = vaddr
             self.vid_size[vid] = 1
-            slot = ConstSlot(vaddr, value)
-            self.ops.append(Op(vid, slot, write_size=1, vbase=vaddr))
+            if value != 0 and CONST_NONZERO_ENGINE == "flow":
+                zero = self.get_const(0)
+                zero_vaddr = self.vid_to_vaddr[zero.vid]
+                slot: Slot = FlowAddImmSlot(vaddr, zero_vaddr, value)
+                deps = [zero.vid]
+            else:
+                slot = ConstSlot(vaddr, value)
+                deps = []
+            self.ops.append(Op(vid, slot, deps=deps, write_size=1, vbase=vaddr))
             self._const_cache[value] = Ref(vid)
         return self._const_cache[value]
 
@@ -1320,6 +1430,7 @@ class KernelBuilder:
     def _emit_broadcast_and_diff(
         self, label: str, sources: list[tuple[Ref, int]],
         n_diff_pairs: int | None = None,
+        xor_const: Ref | None = None,
     ) -> tuple[dict[int, Ref], dict[int, Ref]]:
         """Broadcast values and compute pairwise diffs as needed.
 
@@ -1335,26 +1446,37 @@ class KernelBuilder:
         for i in range(n_pairs):
             base_block, base_off = sources[2 * i]
             other_block, other_off = sources[2 * i + 1]
+            base_ref = base_block.with_offset(base_off)
+            other_ref = other_block.with_offset(other_off)
+            if xor_const is not None:
+                base_ref = self.emit(
+                    f"{label}_xbase_{2 * i}", "alu",
+                    ("^", base_ref, xor_const))
+                other_ref = self.emit(
+                    f"{label}_xother_{2 * i + 1}", "alu",
+                    ("^", other_ref, xor_const))
             vec[2 * i] = self.emit(
                 f"{label}_vec_{2 * i}", "valu",
-                ("vbroadcast", base_block.with_offset(base_off)))
+                ("vbroadcast", base_ref))
             if i < n_diff_pairs:
                 scalar_diff = self.emit(
                     f"{label}_sdiff_{i}", "alu",
-                    ("-", other_block.with_offset(other_off),
-                     base_block.with_offset(base_off)))
+                    ("-", other_ref, base_ref))
                 diff[i] = self.emit(
                     f"{label}_diff_{i}", "valu",
                     ("vbroadcast", scalar_diff))
             else:
                 vec[2 * i + 1] = self.emit(
                     f"{label}_vec_{2 * i + 1}", "valu",
-                    ("vbroadcast", other_block.with_offset(other_off)))
+                    ("vbroadcast", other_ref))
         return vec, diff
 
-    def _emit_setup(self, num_groups: int) -> SetupRefs:
+    def _emit_setup(self, num_groups: int, forest_height: int) -> SetupRefs:
         """Emit all one-time setup ops. Returns typed SetupRefs."""
         V = VLEN
+        if ENABLE_STAGE5_TREE_FUSION and DEPTH_5_VSELECT_GROUPS:
+            raise ValueError(
+                "ENABLE_STAGE5_TREE_FUSION does not currently support depth-5 vselect path")
         const_zero = self.get_const(0)
         const_one = self.get_const(1)
         const_two = self.get_const(2)
@@ -1392,6 +1514,9 @@ class KernelBuilder:
             "tree_d1_left_vec", "valu", ("vbroadcast", tree_vals_lo.with_offset(1)))
         tree_d1_right_vec = self.emit(
             "tree_d1_right_vec", "valu", ("vbroadcast", tree_vals_lo.with_offset(2)))
+        tree_root_vec_xor5: Ref | None = None
+        tree_d1_left_vec_xor5: Ref | None = None
+        tree_d1_right_vec_xor5: Ref | None = None
 
         d2_sources = [(tree_vals_lo, 3 + i) for i in range(4)]
         if REVERSE_TREE_BIT_ORDER_DEPTH_2:
@@ -1402,20 +1527,27 @@ class KernelBuilder:
                 f"tree_d2_vec_{i}", "valu",
                 ("vbroadcast", block.with_offset(off)))
         tree_d2_diff: dict[int, Ref] = {}
+        tree_d2_vec_xor5_inv: dict[int, Ref] = {}
 
         tree_d3_vec: dict[int, Ref] = {}
         tree_d3_diff: dict[int, Ref] = {}
+        tree_d3_vec_xor5_inv: dict[int, Ref] = {}
+        tree_d3_diff_xor5_inv: dict[int, Ref] = {}
         if ENABLE_DEPTH_3_VSELECT:
             d3_sources = (
                 [(tree_vals_lo, 7)]
                 + [(tree_vals_hi, i) for i in range(7)])
             if REVERSE_TREE_BIT_ORDER_DEPTH_3:
                 d3_sources = _bit_reverse_permute(d3_sources, 3)
+            d3_n_pairs = len(d3_sources) // 2
+            d3_n_diff_pairs = max(0, min(DEPTH_3_VSELECT_DIFF_PAIRS, d3_n_pairs))
             tree_d3_vec, tree_d3_diff = self._emit_broadcast_and_diff(
-                "tree_d3", d3_sources, n_diff_pairs=3)
+                "tree_d3", d3_sources, n_diff_pairs=d3_n_diff_pairs)
 
         tree_d4_vec: dict[int, Ref] = {}
         tree_d4_diff: dict[int, Ref] = {}
+        tree_d4_vec_xor5_inv: dict[int, Ref] = {}
+        tree_d4_diff_xor5_inv: dict[int, Ref] = {}
         if ENABLE_DEPTH_4_VSELECT:
             d4_lo_addr = self.emit(
                 "tree_d4_lo_addr", "alu", ("+", fvp, self.get_const(15)))
@@ -1428,8 +1560,106 @@ class KernelBuilder:
                 + [(d4_hi, i) for i in range(8)])
             if REVERSE_TREE_BIT_ORDER_DEPTH_4:
                 d4_sources = _bit_reverse_permute(d4_sources, 4)
+            d4_n_pairs = len(d4_sources) // 2
+            d4_n_diff_pairs = max(0, min(DEPTH_4_VSELECT_DIFF_PAIRS, d4_n_pairs))
             tree_d4_vec, tree_d4_diff = self._emit_broadcast_and_diff(
-                "tree_d4", d4_sources, n_diff_pairs=5)
+                "tree_d4", d4_sources, n_diff_pairs=d4_n_diff_pairs)
+
+        tree_mirror_base_vec: dict[int, Ref] = {}
+        if ENABLE_STAGE5_TREE_FUSION:
+            const5 = self.get_const(HASH_STAGES[5][1])
+
+            tree_root_x5_scalar = self.emit(
+                "tree_root_x5_scalar", "alu",
+                ("^", tree_vals_lo.with_offset(0), const5))
+            tree_root_vec_xor5 = self.emit(
+                "tree_root_vec_xor5", "valu",
+                ("vbroadcast", tree_root_x5_scalar))
+            tree_d1_left_x5_scalar = self.emit(
+                "tree_d1_left_x5_scalar", "alu",
+                ("^", tree_vals_lo.with_offset(1), const5))
+            tree_d1_right_x5_scalar = self.emit(
+                "tree_d1_right_x5_scalar", "alu",
+                ("^", tree_vals_lo.with_offset(2), const5))
+            tree_d1_left_vec_xor5 = self.emit(
+                "tree_d1_left_vec_xor5", "valu",
+                ("vbroadcast", tree_d1_left_x5_scalar))
+            tree_d1_right_vec_xor5 = self.emit(
+                "tree_d1_right_vec_xor5", "valu",
+                ("vbroadcast", tree_d1_right_x5_scalar))
+
+            # Depth 2 mirrored+const sources for inverted branch bits.
+            d2_sources_inv = _bit_complement_permute(
+                [(tree_vals_lo, 3 + i) for i in range(4)], 2)
+            if REVERSE_TREE_BIT_ORDER_DEPTH_2:
+                d2_sources_inv = _bit_reverse_permute(d2_sources_inv, 2)
+            tree_d2_vec_xor5_inv, _ = self._emit_broadcast_and_diff(
+                "tree_d2_x5inv", d2_sources_inv,
+                n_diff_pairs=0, xor_const=const5)
+
+            if ENABLE_DEPTH_3_VSELECT:
+                d3_sources_inv = _bit_complement_permute(
+                    [(tree_vals_lo, 7)] + [(tree_vals_hi, i) for i in range(7)], 3)
+                if REVERSE_TREE_BIT_ORDER_DEPTH_3:
+                    d3_sources_inv = _bit_reverse_permute(d3_sources_inv, 3)
+                d3_inv_pairs = len(d3_sources_inv) // 2
+                d3_inv_diff_pairs = max(
+                    0, min(DEPTH_3_VSELECT_DIFF_PAIRS, d3_inv_pairs))
+                tree_d3_vec_xor5_inv, tree_d3_diff_xor5_inv = (
+                    self._emit_broadcast_and_diff(
+                        "tree_d3_x5inv", d3_sources_inv,
+                        n_diff_pairs=d3_inv_diff_pairs, xor_const=const5))
+
+            if ENABLE_DEPTH_4_VSELECT:
+                d4_sources_inv = _bit_complement_permute(
+                    [(d4_lo, i) for i in range(8)] + [(d4_hi, i) for i in range(8)], 4)
+                if REVERSE_TREE_BIT_ORDER_DEPTH_4:
+                    d4_sources_inv = _bit_reverse_permute(d4_sources_inv, 4)
+                d4_inv_pairs = len(d4_sources_inv) // 2
+                d4_inv_diff_pairs = max(
+                    0, min(DEPTH_4_VSELECT_DIFF_PAIRS, d4_inv_pairs))
+                tree_d4_vec_xor5_inv, tree_d4_diff_xor5_inv = (
+                    self._emit_broadcast_and_diff(
+                        "tree_d4_x5inv", d4_sources_inv,
+                        n_diff_pairs=d4_inv_diff_pairs, xor_const=const5))
+
+            # For scatter rounds under inverted branch semantics, convert
+            # mirrored per-depth indices into true node addresses in one op:
+            # addr = (tree_base + mirror_const(depth)) - mirrored_index.
+            for depth in range(3, forest_height + 1):
+                mirror_const = 3 * (1 << depth) - 1
+                mirror_base_s = self.emit(
+                    f"tree_mirror_base_s_{depth}", "alu",
+                    ("+", tree_base_1indexed_, self.get_const(mirror_const)))
+                tree_mirror_base_vec[depth] = self.emit(
+                    f"tree_mirror_base_v_{depth}", "valu",
+                    ("vbroadcast", mirror_base_s))
+
+        tree_d5_vec: dict[int, Ref] = {}
+        tree_d5_diff: dict[int, Ref] = {}
+        if DEPTH_5_VSELECT_GROUPS:
+            d5_base_addr = self.emit(
+                "tree_d5_base_addr", "alu", ("+", fvp, self.get_const(31)))
+            d5_sources: list[tuple[Ref, int]] = []
+            for block in range(4):
+                if block == 0:
+                    block_addr = d5_base_addr
+                else:
+                    block_addr = self.emit(
+                        f"tree_d5_blk_addr_{block}", "alu",
+                        ("+", d5_base_addr, self.get_const(8 * block)))
+                block_vec = self.emit(
+                    f"tree_d5_blk_{block}", "load", ("vload", block_addr))
+                for i in range(8):
+                    d5_sources.append((block_vec, i))
+
+            if REVERSE_TREE_BIT_ORDER_DEPTH_5:
+                d5_sources = _bit_reverse_permute(d5_sources, 5)
+
+            n_pairs = len(d5_sources) // 2
+            n_diff_pairs = max(0, min(DEPTH_5_VSELECT_DIFF_PAIRS, n_pairs))
+            tree_d5_vec, tree_d5_diff = self._emit_broadcast_and_diff(
+                "tree_d5", d5_sources, n_diff_pairs=n_diff_pairs)
 
         hash_const1_vec: dict[int, Ref] = {}
         for stage in (0, 1, 4, 5):
@@ -1469,12 +1699,22 @@ class KernelBuilder:
             const_zero=const_zero, group_offset=group_offset,
             inp_values_ptr=ivp,
             tree_root_vec=tree_root_vec,
+            tree_root_vec_xor5=tree_root_vec_xor5,
             tree_d1_left_vec=tree_d1_left_vec,
             tree_d1_right_vec=tree_d1_right_vec,
+            tree_d1_left_vec_xor5=tree_d1_left_vec_xor5,
+            tree_d1_right_vec_xor5=tree_d1_right_vec_xor5,
             tree_d2_vec=tree_d2_vec,
+            tree_d2_vec_xor5_inv=tree_d2_vec_xor5_inv,
             tree_d2_diff=tree_d2_diff,
             tree_d3_vec=tree_d3_vec, tree_d3_diff=tree_d3_diff,
+            tree_d3_vec_xor5_inv=tree_d3_vec_xor5_inv,
+            tree_d3_diff_xor5_inv=tree_d3_diff_xor5_inv,
             tree_d4_vec=tree_d4_vec, tree_d4_diff=tree_d4_diff,
+            tree_d4_vec_xor5_inv=tree_d4_vec_xor5_inv,
+            tree_d4_diff_xor5_inv=tree_d4_diff_xor5_inv,
+            tree_d5_vec=tree_d5_vec, tree_d5_diff=tree_d5_diff,
+            tree_mirror_base_vec=tree_mirror_base_vec,
             hash_const1_vec=hash_const1_vec,
             hash_const3_vec=hash_const3_vec,
             hash_mult_vec=hash_mult_vec,
@@ -1533,31 +1773,43 @@ class KernelBuilder:
         return current[0]
 
     def _emit_tree_xor(
-        self, prefix: str, depth: int, g: int,
+        self, prefix: str, depth: int, g: int, rnd: int,
         values: Ref, ts: TreeState, s: SetupRefs,
         start_deps: list[Ref] | None = None,
+        biased_prev: bool = False,
     ) -> Ref:
         """Emit tree node selection + XOR. Returns updated values Ref."""
         V = VLEN
-        bit0, bit1, bit2, bit3 = ts.bits
+        bit0, bit1, bit2, bit3, bit4 = ts.bits
         first_deps = start_deps or None
 
         if depth == 0:
+            root_vec = (
+                s.tree_root_vec_xor5
+                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_root_vec_xor5 is not None)
+                else s.tree_root_vec
+            )
             if ENABLE_INPLACE_VECTOR_DATAFLOW:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu",
-                    ("^", values, s.tree_root_vec),
+                    ("^", values, root_vec),
                     write_to=values,
                     deps=first_deps)
             return self.emit(
                 f"{prefix}_tree_xor", "valu",
-                ("^", values, s.tree_root_vec),
+                ("^", values, root_vec),
                 deps=first_deps)
 
         if depth == 1:
+            if biased_prev and ENABLE_STAGE5_TREE_FUSION:
+                d1_hi = s.tree_d1_left_vec_xor5 or s.tree_d1_left_vec
+                d1_lo = s.tree_d1_right_vec_xor5 or s.tree_d1_right_vec
+            else:
+                d1_hi = s.tree_d1_right_vec
+                d1_lo = s.tree_d1_left_vec
             nv = self.emit(
                 f"{prefix}_tree_select", "flow",
-                ("vselect", bit0, s.tree_d1_right_vec, s.tree_d1_left_vec),
+                ("vselect", bit0, d1_hi, d1_lo),
                 deps=first_deps)
             if ENABLE_INPLACE_VECTOR_DATAFLOW:
                 return self.emit(
@@ -1566,17 +1818,22 @@ class KernelBuilder:
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 2:
+            d2_vec = (
+                s.tree_d2_vec_xor5_inv
+                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d2_vec_xor5_inv)
+                else s.tree_d2_vec
+            )
             if REVERSE_TREE_BIT_ORDER_DEPTH_2:
                 leaf_bit, reduce_bit = bit0, bit1
             else:
                 leaf_bit, reduce_bit = bit1, bit0
             sel0 = self.emit(
                 f"{prefix}_d2_sel0", "flow",
-                ("vselect", leaf_bit, s.tree_d2_vec[1], s.tree_d2_vec[0]),
+                ("vselect", leaf_bit, d2_vec[1], d2_vec[0]),
                 deps=first_deps)
             sel1 = self.emit(
                 f"{prefix}_d2_sel1", "flow",
-                ("vselect", leaf_bit, s.tree_d2_vec[3], s.tree_d2_vec[2]),
+                ("vselect", leaf_bit, d2_vec[3], d2_vec[2]),
                 deps=first_deps)
             nv = self.emit(
                 f"{prefix}_d2_select", "flow",
@@ -1587,14 +1844,24 @@ class KernelBuilder:
                     write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
-        if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g):
+        if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g, rnd):
+            d3_diff = (
+                s.tree_d3_diff_xor5_inv
+                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d3_diff_xor5_inv)
+                else s.tree_d3_diff
+            )
+            d3_vec = (
+                s.tree_d3_vec_xor5_inv
+                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d3_vec_xor5_inv)
+                else s.tree_d3_vec
+            )
             if REVERSE_TREE_BIT_ORDER_DEPTH_3:
                 nv = self._emit_vselect_tree(
-                    prefix, 3, bit0, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit2],
+                    prefix, 3, bit0, d3_diff, d3_vec, [bit1, bit2],
                     start_deps=first_deps)
             else:
                 nv = self._emit_vselect_tree(
-                    prefix, 3, bit2, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit0],
+                    prefix, 3, bit2, d3_diff, d3_vec, [bit1, bit0],
                     start_deps=first_deps)
             if ENABLE_INPLACE_VECTOR_DATAFLOW:
                 return self.emit(
@@ -1602,15 +1869,40 @@ class KernelBuilder:
                     write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
-        if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g):
+        if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g, rnd):
+            d4_diff = (
+                s.tree_d4_diff_xor5_inv
+                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d4_diff_xor5_inv)
+                else s.tree_d4_diff
+            )
+            d4_vec = (
+                s.tree_d4_vec_xor5_inv
+                if (biased_prev and ENABLE_STAGE5_TREE_FUSION and s.tree_d4_vec_xor5_inv)
+                else s.tree_d4_vec
+            )
             if REVERSE_TREE_BIT_ORDER_DEPTH_4:
                 nv = self._emit_vselect_tree(
-                    prefix, 4, bit0, s.tree_d4_diff, s.tree_d4_vec, [bit1, bit2, bit3],
+                    prefix, 4, bit0, d4_diff, d4_vec, [bit1, bit2, bit3],
                     start_deps=first_deps)
             else:
                 nv = self._emit_vselect_tree(
-                    prefix, 4, bit3, s.tree_d4_diff, s.tree_d4_vec, [bit2, bit1, bit0],
+                    prefix, 4, bit3, d4_diff, d4_vec, [bit2, bit1, bit0],
                     start_deps=first_deps)
+            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                return self.emit(
+                    f"{prefix}_tree_xor", "valu", ("^", values, nv),
+                    write_to=values)
+            return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
+
+        if depth == 5 and use_vselect_at_depth_5(g):
+            if REVERSE_TREE_BIT_ORDER_DEPTH_5:
+                nv = self._emit_vselect_tree(
+                    prefix, 5, bit0, s.tree_d5_diff, s.tree_d5_vec,
+                    [bit1, bit2, bit3, bit4], start_deps=first_deps)
+            else:
+                nv = self._emit_vselect_tree(
+                    prefix, 5, bit4, s.tree_d5_diff, s.tree_d5_vec,
+                    [bit3, bit2, bit1, bit0], start_deps=first_deps)
             if ENABLE_INPLACE_VECTOR_DATAFLOW:
                 return self.emit(
                     f"{prefix}_tree_xor", "valu", ("^", values, nv),
@@ -1621,10 +1913,41 @@ class KernelBuilder:
         if first_deps:
             scatter_deps.extend(first_deps)
         scatter = self.alloc_vec(f"{prefix}_scatter", deps=scatter_deps)
-        addr = self.emit(
-            f"{prefix}_tree_base_1indexed", "valu",
-            ("+", s.tree_base_1indexed, ts.index),
-            deps=first_deps)
+        if biased_prev and ENABLE_STAGE5_TREE_FUSION and depth in s.tree_mirror_base_vec:
+            addr = self.emit(
+                f"{prefix}_tree_base_mirror", "valu",
+                ("-", s.tree_mirror_base_vec[depth], ts.index),
+                deps=first_deps)
+        else:
+            addr = self.emit(
+                f"{prefix}_tree_base_1indexed", "valu",
+                ("+", s.tree_base_1indexed, ts.index),
+                deps=first_deps)
+        if SCATTER_VECTOR_XOR:
+            if SCATTER_VECTOR_XOR_DEPTHS and depth not in SCATTER_VECTOR_XOR_DEPTHS:
+                use_vec_scatter = False
+            elif SCATTER_VECTOR_XOR_GROUPS and g not in SCATTER_VECTOR_XOR_GROUPS:
+                use_vec_scatter = False
+            else:
+                use_vec_scatter = True
+        else:
+            use_vec_scatter = False
+
+        if use_vec_scatter:
+            for elem in range(V):
+                self.emit(
+                    f"{prefix}_scat_load_{elem}", "load",
+                    ("load", addr.with_offset(elem)),
+                    write_to=scatter.with_offset(elem))
+            scatter_out = self.emit(
+                f"{prefix}_scat_xor_vec", "valu",
+                ("^", values, scatter))
+            if biased_prev and ENABLE_STAGE5_TREE_FUSION:
+                return self.emit(
+                    f"{prefix}_scat_bias_fix", "valu",
+                    ("^", scatter_out, s.hash_const1_vec[5]))
+            return scatter_out
+
         for elem in range(V):
             loaded = self.emit(
                 f"{prefix}_scat_load_{elem}", "load",
@@ -1633,9 +1956,19 @@ class KernelBuilder:
                 f"{prefix}_scat_xor_{elem}", "alu",
                 ("^", values.with_offset(elem), loaded),
                 write_to=scatter.with_offset(elem))
+        if biased_prev and ENABLE_STAGE5_TREE_FUSION:
+            return self.emit(
+                f"{prefix}_scat_bias_fix", "valu",
+                ("^", scatter, s.hash_const1_vec[5]))
         return scatter
 
-    def _emit_hash(self, prefix: str, values: Ref, s: SetupRefs) -> Ref:
+    def _emit_hash(
+        self,
+        prefix: str,
+        values: Ref,
+        s: SetupRefs,
+        include_stage5_const: bool = True,
+    ) -> Ref:
         """Emit the 6-stage hash. Returns updated values Ref."""
         for stage in range(6):
             op1, _v1, op2, op3, _v3 = HASH_STAGES[stage]
@@ -1677,12 +2010,23 @@ class KernelBuilder:
                          s.hash_mult_vec[stage // 2],
                          s.hash_const1_vec[stage]))
             else:
-                ha = self.emit(
-                    f"{prefix}_hash{stage}_a", "valu",
-                    (op1, values, s.hash_const1_vec[stage]))
                 hb = self.emit(
                     f"{prefix}_hash{stage}_b", "valu",
                     (op3, values, s.hash_const3_vec[stage]))
+                if stage == 5 and not include_stage5_const:
+                    if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                        values = self.emit(
+                            f"{prefix}_hash{stage}_combine", "valu",
+                            (op2, values, hb),
+                            write_to=values)
+                    else:
+                        values = self.emit(
+                            f"{prefix}_hash{stage}_combine", "valu",
+                            (op2, values, hb))
+                    continue
+                ha = self.emit(
+                    f"{prefix}_hash{stage}_a", "valu",
+                    (op1, values, s.hash_const1_vec[stage]))
                 if ENABLE_INPLACE_VECTOR_DATAFLOW:
                     values = self.emit(
                         f"{prefix}_hash{stage}_combine", "valu",
@@ -1697,13 +2041,18 @@ class KernelBuilder:
     def _emit_index_update(
         self, prefix: str, depth: int,
         values: Ref, ts: TreeState, s: SetupRefs,
+        need_bit: bool = True,
         update_index: bool = True,
     ) -> None:
         """Emit branch-bit + index update. Mutates *ts* in place."""
+        if not need_bit and not update_index:
+            return
+
         branch_bit = self.emit(
             f"{prefix}_branch_bit", "valu", ("%", values, s.two_vec))
 
-        ts.set_bit(depth, branch_bit)
+        if need_bit:
+            ts.set_bit(depth, branch_bit)
         if not update_index:
             return
 
@@ -1720,14 +2069,30 @@ class KernelBuilder:
         return rnd if rnd <= forest_height else rnd - (forest_height + 1)
 
     @staticmethod
-    def _round_uses_index(depth: int, g: int) -> bool:
+    def _round_uses_index(depth: int, g: int, rnd: int) -> bool:
         if depth <= 2:
             return False
-        if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g):
+        if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g, rnd):
             return False
-        if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g):
+        if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g, rnd):
+            return False
+        if depth == 5 and use_vselect_at_depth_5(g):
             return False
         return True
+
+    @staticmethod
+    def _tree_consumed_bits(depth: int, g: int, rnd: int) -> tuple[int, ...]:
+        if depth == 1:
+            return (0,)
+        if depth == 2:
+            return (0, 1)
+        if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g, rnd):
+            return (0, 1, 2)
+        if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g, rnd):
+            return (0, 1, 2, 3)
+        if depth == 5 and use_vselect_at_depth_5(g):
+            return (0, 1, 2, 3, 4)
+        return ()
 
     @staticmethod
     def _deep_gate_window(rnd: int, depth: int) -> int:
@@ -1749,53 +2114,101 @@ class KernelBuilder:
         V = VLEN
         num_groups = batch_size // V
 
-        s = self._emit_setup(num_groups)
+        round_depths = [self._round_depth(rnd, forest_height) for rnd in range(rounds)]
+        stage5_skip_const: list[bool] = [False] * rounds
+        if ENABLE_STAGE5_TREE_FUSION:
+            if STAGE5_FUSION_SKIP_ROUNDS:
+                for rnd in range(max(0, rounds - 1)):
+                    if rnd in STAGE5_FUSION_SKIP_ROUNDS:
+                        stage5_skip_const[rnd] = True
+            else:
+                for rnd in range(max(0, rounds - 1)):
+                    stage5_skip_const[rnd] = True
+        stage5_biased_prev: list[bool] = [False] * rounds
+        for rnd in range(1, rounds):
+            stage5_biased_prev[rnd] = stage5_skip_const[rnd - 1]
+
+        s = self._emit_setup(num_groups, forest_height)
 
         completed_stores: list[Ref] = []
         deep_round_tokens: dict[int, list[Ref]] = defaultdict(list)
 
-        round_depths = [self._round_depth(rnd, forest_height) for rnd in range(rounds)]
+        group_order = list(range(num_groups))
+        if GROUP_EMIT_ORDER_MODE != "identity":
+            # Lower score = lighter (more vselect usage in early rounds).
+            def weight(g: int) -> int:
+                w = 0
+                if not use_vselect_at_depth_3(g):
+                    w += 1
+                if not use_vselect_at_depth_4(g):
+                    w += 1
+                return w
+
+            group_order.sort(key=weight, reverse=(GROUP_EMIT_ORDER_MODE == "heavy_first"))
 
         def compute_future_index_needed(g: int) -> list[bool]:
             future: list[bool] = [False] * rounds
             need_later = False
             for rnd in range(rounds - 1, -1, -1):
                 future[rnd] = need_later
-                need_later = need_later or self._round_uses_index(round_depths[rnd], g)
+                need_later = need_later or self._round_uses_index(
+                    round_depths[rnd], g, rnd)
             return future
 
-        for g in range(num_groups):
+        def compute_future_bit_needed(g: int) -> list[bool]:
+            # For each round that emits branch_bit at depth d, decide whether
+            # this specific bit definition is consumed by any future vselect
+            # tree before depth d is defined again.
+            future_bit_needed: list[bool] = [False] * rounds
+            needed_by_depth: list[bool] = [False] * len(TreeState().bits)
+
+            for rnd in range(rounds - 1, -1, -1):
+                depth = round_depths[rnd]
+                for bit_depth in self._tree_consumed_bits(depth, g, rnd):
+                    if bit_depth < len(needed_by_depth):
+                        needed_by_depth[bit_depth] = True
+
+                is_overflow = (depth == forest_height)
+                if not is_overflow and rnd < rounds - 1 and depth < len(needed_by_depth):
+                    future_bit_needed[rnd] = needed_by_depth[depth]
+                    needed_by_depth[depth] = False
+
+            return future_bit_needed
+
+        for logical_g, physical_g in enumerate(group_order):
             concurrency_deps: list[Ref] = (
-                [completed_stores[g - MAX_CONCURRENT_GROUPS]]
-                if g >= MAX_CONCURRENT_GROUPS else [])
+                [completed_stores[logical_g - MAX_CONCURRENT_GROUPS]]
+                if logical_g >= MAX_CONCURRENT_GROUPS else [])
 
             load_addr = self.emit(
-                f"group{g}_load_addr", "alu",
-                ("+", s.inp_values_ptr, s.group_offset[g]),
+                f"group{physical_g}_load_addr", "alu",
+                ("+", s.inp_values_ptr, s.group_offset[physical_g]),
                 deps=concurrency_deps)
-            values = self.emit(f"group{g}_values", "load", ("vload", load_addr))
+            values = self.emit(f"group{physical_g}_values", "load", ("vload", load_addr))
 
             ts = TreeState()
-            future_index_needed = compute_future_index_needed(g)
+            future_index_needed = compute_future_index_needed(logical_g)
+            future_bit_needed = compute_future_bit_needed(logical_g)
 
             for rnd in range(rounds):
                 depth = round_depths[rnd]
                 is_overflow = (depth == forest_height)
-                prefix = f"g{g}_r{rnd}"
+                prefix = f"g{physical_g}_r{rnd}"
                 deep_window = self._deep_gate_window(rnd, depth)
 
                 round_start_deps: list[Ref] = []
-                if deep_window > 0 and g >= deep_window:
+                if deep_window > 0 and logical_g >= deep_window:
                     round_start_deps.append(
-                        deep_round_tokens[rnd][g - deep_window]
+                        deep_round_tokens[rnd][logical_g - deep_window]
                     )
 
                 tree_values = self._emit_tree_xor(
-                    prefix, depth, g, values, ts, s,
+                    prefix, depth, logical_g, rnd, values, ts, s,
                     start_deps=round_start_deps,
+                    biased_prev=stage5_biased_prev[rnd],
                 )
 
-                if deep_window > 0 and (g + deep_window) < num_groups:
+                if deep_window > 0 and (logical_g + deep_window) < num_groups:
                     if USE_VECTOR_DEEP_TOKENS:
                         deep_round_tokens[rnd].append(tree_values)
                     else:
@@ -1811,17 +2224,22 @@ class KernelBuilder:
                             )
                         )
 
-                values = self._emit_hash(prefix, tree_values, s)
+                values = self._emit_hash(
+                    prefix, tree_values, s,
+                    include_stage5_const=not stage5_skip_const[rnd],
+                )
 
                 if not is_overflow and rnd < rounds - 1:
                     update_index = future_index_needed[rnd]
+                    need_bit = future_bit_needed[rnd]
                     self._emit_index_update(
                         prefix, depth, values, ts, s,
+                        need_bit=need_bit,
                         update_index=update_index,
                     )
 
             store_ref = self.emit(
-                f"group{g}_store", "store", ("vstore", load_addr, values))
+                f"group{physical_g}_store", "store", ("vstore", load_addr, values))
             completed_stores.append(store_ref)
 
         print(f"Emitted {len(self.ops)} ops")
