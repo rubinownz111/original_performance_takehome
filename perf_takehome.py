@@ -24,12 +24,15 @@ Optimizations applied:
 
 from __future__ import annotations
 
+import csv
 from collections import defaultdict
 import dataclasses
 import heapq
+import json
+import os
 import random
 import unittest
-from typing import Literal, assert_never, get_args
+from typing import Any, Literal, assert_never, get_args
 
 from problem import (
     DebugInfo,
@@ -79,6 +82,10 @@ CRITICAL_PATH_SCALE = 100.0
 # Cross engine bonus currently has no impact.
 MAX_CROSS_ENGINE_BONUS = 0
 EMIT_ORDER_SCALE = 10.0
+
+# Optional scheduler telemetry output (disabled by default).
+# Set SCHED_TELEMETRY_PATH to a .csv or .jsonl path to enable.
+SCHED_TELEMETRY_PATH = os.getenv("SCHED_TELEMETRY_PATH", "").strip()
 
 # ══════════════════════════════════════════════════════════════════════
 #  Type Definitions
@@ -520,6 +527,10 @@ class Scheduler:
 
         self.allocator = ScratchAllocator(scratch_size)
         self.id_to_idx: dict[str, int] = {op.id: i for i, op in enumerate(ops)}
+        self._telemetry_path: str = SCHED_TELEMETRY_PATH
+        self._telemetry_rows: list[dict[str, Any]] | None = (
+            [] if self._telemetry_path else None
+        )
 
         self._build_dep_graph()
         self._compute_priorities()
@@ -528,6 +539,78 @@ class Scheduler:
         if zero_vaddr is not None:
             zero_real = self.allocator.alloc(1)
             self.allocator.vmap[zero_vaddr] = zero_real
+
+    @property
+    def telemetry_enabled(self) -> bool:
+        return self._telemetry_rows is not None
+
+    def _record_cycle_telemetry(
+        self,
+        cycle: int,
+        slot_counts: dict[str, int],
+        ready_start: int,
+        ready_end: int,
+        scheduled_count: int,
+        deferred_count: int,
+        done_count: int,
+        defer_reasons: dict[str, int],
+    ) -> None:
+        if self._telemetry_rows is None:
+            return
+        row: dict[str, Any] = {
+            "cycle": cycle,
+            "ready_start": ready_start,
+            "ready_end": ready_end,
+            "scheduled": scheduled_count,
+            "deferred": deferred_count,
+            "done": done_count,
+            "scratch_current": self.allocator.current_usage,
+            "scratch_peak": self.allocator.peak_usage,
+        }
+        for engine in ("alu", "valu", "load", "store", "flow"):
+            row[f"slot_{engine}"] = slot_counts.get(engine, 0)
+        for reason, count in defer_reasons.items():
+            row[f"defer_{reason}"] = count
+        self._telemetry_rows.append(row)
+
+    def _flush_telemetry(self) -> None:
+        if self._telemetry_rows is None or not self._telemetry_path:
+            return
+        rows = self._telemetry_rows
+        if not rows:
+            return
+        out_path = self._telemetry_path
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        if out_path.endswith(".jsonl"):
+            with open(out_path, "w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row, sort_keys=True) + "\n")
+            return
+        fields: set[str] = set()
+        for row in rows:
+            fields.update(row.keys())
+        ordered = [
+            "cycle",
+            "ready_start",
+            "ready_end",
+            "scheduled",
+            "deferred",
+            "done",
+            "scratch_current",
+            "scratch_peak",
+            "slot_alu",
+            "slot_valu",
+            "slot_load",
+            "slot_store",
+            "slot_flow",
+        ]
+        extras = sorted(k for k in fields if k not in ordered)
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=ordered + extras)
+            writer.writeheader()
+            writer.writerows(rows)
 
     def _build_dep_graph(self) -> None:
         n = self.n
@@ -787,13 +870,21 @@ class Scheduler:
             slot_counts: dict[str, int] = defaultdict(int)
             scheduled: list[int] = []
             deferred: list[tuple[float, int, int]] = []
-            valu_this_cycle: list[tuple[Op, Slot]] = []
+            ready_start = len(ready)
+            defer_reasons: dict[str, int] = (
+                defaultdict(int) if self.telemetry_enabled else {}
+            )
+
+            def defer_item(item: tuple[float, int, int], reason: str) -> None:
+                deferred.append(item)
+                if self.telemetry_enabled:
+                    defer_reasons[reason] = defer_reasons.get(reason, 0) + 1
 
             while ready:
                 neg_pri, order, idx = heapq.heappop(ready)
 
                 if earliest[idx] > cycle:
-                    deferred.append((neg_pri, order, idx))
+                    defer_item((neg_pri, order, idx), "deps_not_ready")
                     continue
 
                 op = ops[idx]
@@ -801,7 +892,7 @@ class Scheduler:
 
                 if isinstance(op.slot, AllocSlot):
                     if alloc.needs_new_alloc(op) and not alloc.can_alloc(op.write_size):
-                        deferred.append((neg_pri, order, idx))
+                        defer_item((neg_pri, order, idx), "scratch_full_alloc")
                         continue
                     alloc.alloc_for_op(op)
                     scheduled.append(idx)
@@ -809,14 +900,14 @@ class Scheduler:
 
                 if isinstance(op.slot, ConstSlot) and op.slot.value == 0:
                     if alloc.needs_new_alloc(op) and not alloc.can_alloc(op.write_size):
-                        deferred.append((neg_pri, order, idx))
+                        defer_item((neg_pri, order, idx), "scratch_full_const_zero")
                         continue
                     alloc.alloc_for_op(op)
                     scheduled.append(idx)
                     continue
 
                 if alloc.needs_new_alloc(op) and not alloc.can_alloc(op.write_size):
-                    deferred.append((neg_pri, order, idx))
+                    defer_item((neg_pri, order, idx), "scratch_full")
                     continue
 
                 if slot_counts[engine] >= SLOT_LIMITS.get(engine, 0):
@@ -826,7 +917,7 @@ class Scheduler:
                                 slot_counts, result, result_cycles):
                             scheduled.append(idx)
                             continue
-                        deferred.append((neg_pri, order, idx))
+                        defer_item((neg_pri, order, idx), "valu_full_offload_failed")
                         continue
                     elif (isinstance(op.slot, ConstSlot) 
                           and slot_counts.get("flow", 0) < SLOT_LIMITS["flow"] and self.zero_vaddr is not None):
@@ -838,7 +929,7 @@ class Scheduler:
                         slot_counts["flow"] = slot_counts.get("flow", 0) + 1
                         scheduled.append(idx)
                         continue
-                    deferred.append((neg_pri, order, idx))
+                    defer_item((neg_pri, order, idx), f"{engine}_full")
                     continue
 
                 if (PROACTIVE_VALU_OFFLOAD
@@ -854,8 +945,6 @@ class Scheduler:
                 real_slot = alloc.rewrite_slot(op.slot)
                 bundle.setdefault(engine, []).append(slot_to_tuple(real_slot))
                 slot_counts[engine] += 1
-                if engine == "valu":
-                    valu_this_cycle.append((op, real_slot))
                 scheduled.append(idx)
 
             self._free_after_cycle(scheduled)
@@ -886,6 +975,17 @@ class Scheduler:
                 for idx, order in old_ready:
                     heapq.heappush(ready, (-self.priority[idx], order, idx))
 
+            self._record_cycle_telemetry(
+                cycle=cycle,
+                slot_counts=slot_counts,
+                ready_start=ready_start,
+                ready_end=len(ready),
+                scheduled_count=len(scheduled),
+                deferred_count=len(deferred),
+                done_count=len(done_set),
+                defer_reasons=defer_reasons,
+            )
+
             cycle += 1
             if not scheduled and len(done_set) < n:
                 print(f"SCHEDULER STUCK at cycle {cycle}, "
@@ -894,6 +994,7 @@ class Scheduler:
                       f"usage={alloc.current_usage}/{alloc.scratch_size}")
                 break
 
+        self._flush_telemetry()
         print(f"Scheduled {n} ops -> {len(result)} cycles  "
               f"(peak scratch {alloc.peak_usage}/{alloc.scratch_size})")
         return result
