@@ -102,12 +102,12 @@ class Ref:
 
 def use_vselect_at_depth_3(g: int) -> bool:
     """Which groups use vselect at depth 3 (vs scatter loads)."""
-    return g % 3 != 2 or g > 26
+    return g % 3 != 2 or g > 26 or g == 14
 
 
 def use_vselect_at_depth_4(g: int) -> bool:
     """Which groups use vselect at depth 4 (vs scatter loads)."""
-    return g % 4 in (0, 3) and use_vselect_at_depth_3(g)
+    return g in {0, 3, 9, 12, 15, 18, 21, 22, 24, 27, 30}
 
 
 def _bit_reverse_permute(sources: list, n_bits: int) -> list:
