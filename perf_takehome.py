@@ -107,7 +107,7 @@ def use_vselect_at_depth_3(g: int) -> bool:
 
 def use_vselect_at_depth_4(g: int) -> bool:
     """Which groups use vselect at depth 4 (vs scatter loads)."""
-    return g % 3 == 0 and use_vselect_at_depth_3(g)
+    return g % 4 in (0, 3) and use_vselect_at_depth_3(g)
 
 
 def _bit_reverse_permute(sources: list, n_bits: int) -> list:
