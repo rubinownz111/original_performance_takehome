@@ -102,7 +102,10 @@ class Ref:
 
 def use_vselect_at_depth_3(g: int) -> bool:
     """Which groups use vselect at depth 3 (vs scatter loads)."""
-    return g % 3 != 2 or g > 26
+    # Group 14 benefits from vselect at depth 3: it lowers total cycles in
+    # the reference benchmark without increasing pressure enough to deadlock
+    # the allocator/scheduler.
+    return (g % 3 != 2 or g > 26 or g == 14)
 
 
 def use_vselect_at_depth_4(g: int) -> bool:
