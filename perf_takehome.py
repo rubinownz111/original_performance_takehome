@@ -63,6 +63,21 @@ REVERSE_TREE_BIT_ORDER_DEPTH_2: bool = True
 REVERSE_TREE_BIT_ORDER_DEPTH_3: bool = False
 REVERSE_TREE_BIT_ORDER_DEPTH_4: bool = False
 MAX_CONCURRENT_GROUPS: int = 20
+# Round-aware interleaving gate for deep tree rounds.
+# These depths are load-heavy due to scatter path, so we cap their in-flight
+# groups independently from the global group window.
+DEEP_ROUND_DEPTH_THRESHOLD: int = 6
+# Best measured setting for selective deep gating on the submission case.
+MAX_CONCURRENT_DEEP_ROUNDS: int = 20
+# Optional per-depth or per-round deep-gate overrides.
+# When present, override the global window for matching depth/round.
+DEEP_GATE_WINDOW_BY_DEPTH: dict[int, int] = {}
+DEEP_GATE_WINDOW_BY_ROUND: dict[int, int] = {}
+# Experimental: use tree result vectors directly as deep-gate tokens instead of
+# emitting scalar ALU token ops.
+USE_VECTOR_DEEP_TOKENS: bool = False
+# Experimental: enable full-vector in-place writes for tree/hash updates.
+ENABLE_INPLACE_VECTOR_DATAFLOW: bool = False
 BASELINE_CYCLES: int = 147734
 PRIORITY_RECOMPUTE_INTERVAL: int = 5
 
@@ -76,6 +91,13 @@ LATE_SCHEDULE_THRESHOLD = 300
 # non-offloadable ops like multiply_add. When False, prefer VALU when it
 # has room and only offload to ALU when VALU is full.
 PROACTIVE_VALU_OFFLOAD: bool = True
+# When True, offloadable VALU ops may be deferred briefly so they can be
+# decomposed to ALU ops in a later cycle instead of consuming VALU slots now.
+DEFER_OFFLOADABLE_VALU: bool = False
+MAX_OFFLOAD_DEFER_CYCLES: int = 2
+# Prefer emitting non-zero consts on flow/add_imm when possible to relieve
+# load-engine pressure (using the mapped zero constant as base).
+PREFER_FLOW_CONST: bool = False
 
 # Priority calculation scales
 CRITICAL_PATH_SCALE = 100.0
@@ -416,6 +438,8 @@ class ScratchAllocator:
 
         self.vmap: dict[int, int] = {}
         self.vid_ownership: dict[str, tuple[int, int]] = {}
+        self.vbase_owner: dict[int, str] = {}
+        self.owner_vbase: dict[str, int] = {}
 
     @property
     def scalar_next(self) -> int:
@@ -482,9 +506,22 @@ class ScratchAllocator:
         if op.write_size == 0 or op.vbase < 0:
             return
         if op.vbase in self.vmap:
+            # Full-vector in-place write: transfer ownership so frees track
+            # the latest writer of this physical block.
+            if op.write_size == self.V:
+                prev_owner = self.vbase_owner.get(op.vbase)
+                if prev_owner is not None:
+                    self.vid_ownership.pop(prev_owner, None)
+                    self.owner_vbase.pop(prev_owner, None)
+                real_base = self.vmap[op.vbase]
+                self.vid_ownership[op.id] = (real_base, op.write_size)
+                self.vbase_owner[op.vbase] = op.id
+                self.owner_vbase[op.id] = op.vbase
             return
         real_base = self.alloc(op.write_size)
         self.vid_ownership[op.id] = (real_base, op.write_size)
+        self.vbase_owner[op.vbase] = op.id
+        self.owner_vbase[op.id] = op.vbase
         for k in range(op.write_size):
             self.vmap[op.vbase + k] = real_base + k
 
@@ -492,6 +529,9 @@ class ScratchAllocator:
         """Free a vid's scratch if it has no remaining readers."""
         if remaining_readers.get(vid, 0) <= 0 and vid in self.vid_ownership:
             real_base, size = self.vid_ownership.pop(vid)
+            vbase = self.owner_vbase.pop(vid, None)
+            if vbase is not None and self.vbase_owner.get(vbase) == vid:
+                del self.vbase_owner[vbase]
             self.free(real_base, size)
 
     def rewrite_slot(self, slot: Slot) -> Slot:
@@ -921,6 +961,21 @@ class Scheduler:
                     defer_item((neg_pri, order, idx), "scratch_full")
                     continue
 
+                if (PREFER_FLOW_CONST
+                        and isinstance(op.slot, ConstSlot)
+                        and op.slot.value != 0
+                        and self.zero_vaddr is not None
+                        and slot_counts.get("flow", 0) < SLOT_LIMITS["flow"]):
+                    alloc.alloc_for_op(op)
+                    dest_r = alloc.vmap[op.slot.dest]
+                    zero_r = alloc.vmap[self.zero_vaddr]
+                    bundle.setdefault("flow", []).append(
+                        ("add_imm", dest_r, zero_r, op.slot.value)
+                    )
+                    slot_counts["flow"] = slot_counts.get("flow", 0) + 1
+                    scheduled.append(idx)
+                    continue
+
                 if slot_counts[engine] >= SLOT_LIMITS.get(engine, 0):
                     if engine == "valu" and self._is_alu_offloadable(op):
                         if self._try_split_alu_offload(
@@ -950,6 +1005,10 @@ class Scheduler:
                             op, earliest[idx], cycle, bundle,
                             slot_counts, result, result_cycles):
                         scheduled.append(idx)
+                        continue
+                    if (DEFER_OFFLOADABLE_VALU
+                            and cycle - earliest[idx] < MAX_OFFLOAD_DEFER_CYCLES):
+                        defer_item((neg_pri, order, idx), "defer_for_alu_offload")
                         continue
 
                 alloc.alloc_for_op(op)
@@ -1150,6 +1209,7 @@ class KernelBuilder:
         for element sub-indexing).
         """
         op_name = slot_args[0]
+        produced_size = self._infer_write_size(engine, op_name)
         auto_deps: list[str] = []
 
         resolved: list = [op_name]
@@ -1163,14 +1223,22 @@ class KernelBuilder:
                 resolved.append(arg)
 
         if write_to is not None:
-            dest_vaddr = self.vid_to_vaddr[write_to.vid] + write_to.offset
-            write_size = 1
+            if produced_size == VLEN:
+                if write_to.offset != 0:
+                    raise ValueError("vector write_to requires offset 0")
+                dest_vaddr = self.vid_to_vaddr[write_to.vid]
+                write_size = VLEN
+                auto_deps.append(write_to.vid)
+            else:
+                dest_vaddr = self.vid_to_vaddr[write_to.vid] + write_to.offset
+                write_size = 1
             self.vid_to_vaddr[vid] = dest_vaddr
-            self.vid_size[vid] = 1
-            self.block_writers[write_to.vid].append(vid)
-            auto_deps.append(write_to.vid)
+            self.vid_size[vid] = write_size
+            if write_size == 1:
+                self.block_writers[write_to.vid].append(vid)
+                auto_deps.append(write_to.vid)
         else:
-            write_size = self._infer_write_size(engine, op_name)
+            write_size = produced_size
             if write_size > 0:
                 dest_vaddr = self.virt_ptr
                 self.virt_ptr += write_size
@@ -1423,6 +1491,7 @@ class KernelBuilder:
         diff: dict[int, Ref],
         vec: dict[int, Ref],
         reduce_bits: list[Ref],
+        start_deps: list[Ref] | None = None,
     ) -> Ref:
         """Build multiply_add leaves, then binary vselect reduction.
 
@@ -1439,14 +1508,16 @@ class KernelBuilder:
         current: list[Ref] = [
             self.emit(
                 f"{prefix}_{label}_sel_{i}", "valu",
-                ("multiply_add", leaf_bit, diff[i], vec[2 * i]))
+                ("multiply_add", leaf_bit, diff[i], vec[2 * i]),
+                deps=start_deps)
             for i in range(n_diff)
         ]
         # Remaining leaves: vselect on flow engine
         current.extend([
             self.emit(
                 f"{prefix}_{label}_sel_{i}", "flow",
-                ("vselect", leaf_bit, vec[2 * i + 1], vec[2 * i]))
+                ("vselect", leaf_bit, vec[2 * i + 1], vec[2 * i]),
+                deps=start_deps)
             for i in range(n_diff, n_leaves)
         ])
 
@@ -1464,20 +1535,34 @@ class KernelBuilder:
     def _emit_tree_xor(
         self, prefix: str, depth: int, g: int,
         values: Ref, ts: TreeState, s: SetupRefs,
+        start_deps: list[Ref] | None = None,
     ) -> Ref:
         """Emit tree node selection + XOR. Returns updated values Ref."""
         V = VLEN
         bit0, bit1, bit2, bit3 = ts.bits
+        first_deps = start_deps or None
 
         if depth == 0:
+            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                return self.emit(
+                    f"{prefix}_tree_xor", "valu",
+                    ("^", values, s.tree_root_vec),
+                    write_to=values,
+                    deps=first_deps)
             return self.emit(
                 f"{prefix}_tree_xor", "valu",
-                ("^", values, s.tree_root_vec))
+                ("^", values, s.tree_root_vec),
+                deps=first_deps)
 
         if depth == 1:
             nv = self.emit(
                 f"{prefix}_tree_select", "flow",
-                ("vselect", bit0, s.tree_d1_right_vec, s.tree_d1_left_vec))
+                ("vselect", bit0, s.tree_d1_right_vec, s.tree_d1_left_vec),
+                deps=first_deps)
+            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                return self.emit(
+                    f"{prefix}_tree_xor", "valu", ("^", values, nv),
+                    write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 2:
@@ -1487,37 +1572,59 @@ class KernelBuilder:
                 leaf_bit, reduce_bit = bit1, bit0
             sel0 = self.emit(
                 f"{prefix}_d2_sel0", "flow",
-                ("vselect", leaf_bit, s.tree_d2_vec[1], s.tree_d2_vec[0]))
+                ("vselect", leaf_bit, s.tree_d2_vec[1], s.tree_d2_vec[0]),
+                deps=first_deps)
             sel1 = self.emit(
                 f"{prefix}_d2_sel1", "flow",
-                ("vselect", leaf_bit, s.tree_d2_vec[3], s.tree_d2_vec[2]))
+                ("vselect", leaf_bit, s.tree_d2_vec[3], s.tree_d2_vec[2]),
+                deps=first_deps)
             nv = self.emit(
                 f"{prefix}_d2_select", "flow",
                 ("vselect", reduce_bit, sel1, sel0))
+            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                return self.emit(
+                    f"{prefix}_tree_xor", "valu", ("^", values, nv),
+                    write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g):
             if REVERSE_TREE_BIT_ORDER_DEPTH_3:
                 nv = self._emit_vselect_tree(
-                    prefix, 3, bit0, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit2])
+                    prefix, 3, bit0, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit2],
+                    start_deps=first_deps)
             else:
                 nv = self._emit_vselect_tree(
-                    prefix, 3, bit2, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit0])
+                    prefix, 3, bit2, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit0],
+                    start_deps=first_deps)
+            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                return self.emit(
+                    f"{prefix}_tree_xor", "valu", ("^", values, nv),
+                    write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g):
             if REVERSE_TREE_BIT_ORDER_DEPTH_4:
                 nv = self._emit_vselect_tree(
-                    prefix, 4, bit0, s.tree_d4_diff, s.tree_d4_vec, [bit1, bit2, bit3])
+                    prefix, 4, bit0, s.tree_d4_diff, s.tree_d4_vec, [bit1, bit2, bit3],
+                    start_deps=first_deps)
             else:
                 nv = self._emit_vselect_tree(
-                    prefix, 4, bit3, s.tree_d4_diff, s.tree_d4_vec, [bit2, bit1, bit0])
+                    prefix, 4, bit3, s.tree_d4_diff, s.tree_d4_vec, [bit2, bit1, bit0],
+                    start_deps=first_deps)
+            if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                return self.emit(
+                    f"{prefix}_tree_xor", "valu", ("^", values, nv),
+                    write_to=values)
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
-        scatter = self.alloc_vec(f"{prefix}_scatter", deps=[ts.index, values])
+        scatter_deps = [ts.index, values]
+        if first_deps:
+            scatter_deps.extend(first_deps)
+        scatter = self.alloc_vec(f"{prefix}_scatter", deps=scatter_deps)
         addr = self.emit(
             f"{prefix}_tree_base_1indexed", "valu",
-            ("+", s.tree_base_1indexed, ts.index))
+            ("+", s.tree_base_1indexed, ts.index),
+            deps=first_deps)
         for elem in range(V):
             loaded = self.emit(
                 f"{prefix}_scat_load_{elem}", "load",
@@ -1544,17 +1651,31 @@ class KernelBuilder:
                     f"{prefix}_hash23_b", "valu",
                     ("multiply_add", values,
                      s.fused_23_mult_hb, s.fused_23_const_hb))
-                values = self.emit(
-                    f"{prefix}_hash23_combine", "valu",
-                    ("^", ha, hb))
+                if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                    values = self.emit(
+                        f"{prefix}_hash23_combine", "valu",
+                        ("^", ha, hb),
+                        write_to=values)
+                else:
+                    values = self.emit(
+                        f"{prefix}_hash23_combine", "valu",
+                        ("^", ha, hb))
             elif stage == 3:
                 continue  # handled in stage 2
             elif stage in (0, 4):
-                values = self.emit(
-                    f"{prefix}_hash{stage}", "valu",
-                    ("multiply_add", values,
-                     s.hash_mult_vec[stage // 2],
-                     s.hash_const1_vec[stage]))
+                if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                    values = self.emit(
+                        f"{prefix}_hash{stage}", "valu",
+                        ("multiply_add", values,
+                         s.hash_mult_vec[stage // 2],
+                         s.hash_const1_vec[stage]),
+                        write_to=values)
+                else:
+                    values = self.emit(
+                        f"{prefix}_hash{stage}", "valu",
+                        ("multiply_add", values,
+                         s.hash_mult_vec[stage // 2],
+                         s.hash_const1_vec[stage]))
             else:
                 ha = self.emit(
                     f"{prefix}_hash{stage}_a", "valu",
@@ -1562,9 +1683,15 @@ class KernelBuilder:
                 hb = self.emit(
                     f"{prefix}_hash{stage}_b", "valu",
                     (op3, values, s.hash_const3_vec[stage]))
-                values = self.emit(
-                    f"{prefix}_hash{stage}_combine", "valu",
-                    (op2, ha, hb))
+                if ENABLE_INPLACE_VECTOR_DATAFLOW:
+                    values = self.emit(
+                        f"{prefix}_hash{stage}_combine", "valu",
+                        (op2, ha, hb),
+                        write_to=values)
+                else:
+                    values = self.emit(
+                        f"{prefix}_hash{stage}_combine", "valu",
+                        (op2, ha, hb))
         return values
 
     def _emit_index_update(
@@ -1588,6 +1715,30 @@ class KernelBuilder:
                 f"{prefix}_new_index", "valu",
                 ("multiply_add", s.two_vec, ts.index, branch_bit))
 
+    @staticmethod
+    def _round_depth(rnd: int, forest_height: int) -> int:
+        return rnd if rnd <= forest_height else rnd - (forest_height + 1)
+
+    @staticmethod
+    def _round_uses_index(depth: int, g: int) -> bool:
+        if depth <= 2:
+            return False
+        if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g):
+            return False
+        if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g):
+            return False
+        return True
+
+    @staticmethod
+    def _deep_gate_window(rnd: int, depth: int) -> int:
+        if rnd in DEEP_GATE_WINDOW_BY_ROUND:
+            return DEEP_GATE_WINDOW_BY_ROUND[rnd]
+        if depth in DEEP_GATE_WINDOW_BY_DEPTH:
+            return DEEP_GATE_WINDOW_BY_DEPTH[depth]
+        if depth >= DEEP_ROUND_DEPTH_THRESHOLD:
+            return MAX_CONCURRENT_DEEP_ROUNDS
+        return 0
+
     def build_kernel(
         self,
         forest_height: int,
@@ -1601,6 +1752,17 @@ class KernelBuilder:
         s = self._emit_setup(num_groups)
 
         completed_stores: list[Ref] = []
+        deep_round_tokens: dict[int, list[Ref]] = defaultdict(list)
+
+        round_depths = [self._round_depth(rnd, forest_height) for rnd in range(rounds)]
+
+        def compute_future_index_needed(g: int) -> list[bool]:
+            future: list[bool] = [False] * rounds
+            need_later = False
+            for rnd in range(rounds - 1, -1, -1):
+                future[rnd] = need_later
+                need_later = need_later or self._round_uses_index(round_depths[rnd], g)
+            return future
 
         for g in range(num_groups):
             concurrency_deps: list[Ref] = (
@@ -1614,34 +1776,45 @@ class KernelBuilder:
             values = self.emit(f"group{g}_values", "load", ("vload", load_addr))
 
             ts = TreeState()
+            future_index_needed = compute_future_index_needed(g)
 
             for rnd in range(rounds):
-                depth = (rnd if rnd <= forest_height
-                         else rnd - (forest_height + 1))
+                depth = round_depths[rnd]
                 is_overflow = (depth == forest_height)
                 prefix = f"g{g}_r{rnd}"
+                deep_window = self._deep_gate_window(rnd, depth)
 
-                values = self._emit_tree_xor(prefix, depth, g, values, ts, s)
-                values = self._emit_hash(prefix, values, s)
+                round_start_deps: list[Ref] = []
+                if deep_window > 0 and g >= deep_window:
+                    round_start_deps.append(
+                        deep_round_tokens[rnd][g - deep_window]
+                    )
+
+                tree_values = self._emit_tree_xor(
+                    prefix, depth, g, values, ts, s,
+                    start_deps=round_start_deps,
+                )
+
+                if deep_window > 0 and (g + deep_window) < num_groups:
+                    if USE_VECTOR_DEEP_TOKENS:
+                        deep_round_tokens[rnd].append(tree_values)
+                    else:
+                        # Use a scalar token to represent "deep-tree work for
+                        # this group/round is complete" without extending
+                        # vector liveness.
+                        deep_round_tokens[rnd].append(
+                            self.emit(
+                                f"{prefix}_deep_round_token",
+                                "alu",
+                                ("+", s.const_zero, s.const_zero),
+                                deps=[tree_values],
+                            )
+                        )
+
+                values = self._emit_hash(prefix, tree_values, s)
 
                 if not is_overflow and rnd < rounds - 1:
-                    update_index = True
-                    # On the penultimate round, we only need the branch bit for
-                    # final-round vselect paths; index materialization is dead.
-                    if rnd == rounds - 2:
-                        nxt = rnd + 1
-                        next_depth = (
-                            nxt if nxt <= forest_height
-                            else nxt - (forest_height + 1)
-                        )
-                        if (next_depth == 3
-                                and ENABLE_DEPTH_3_VSELECT
-                                and use_vselect_at_depth_3(g)):
-                            update_index = False
-                        elif (next_depth == 4
-                                and ENABLE_DEPTH_4_VSELECT
-                                and use_vselect_at_depth_4(g)):
-                            update_index = False
+                    update_index = future_index_needed[rnd]
                     self._emit_index_update(
                         prefix, depth, values, ts, s,
                         update_index=update_index,
