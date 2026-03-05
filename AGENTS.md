@@ -26,6 +26,9 @@
 - Note: the currently checked-out worktree on `2026-03-05` re-validates at this `1065` baseline. Older `1078-1082` entries below are useful historical context from earlier architecture exploration, but they do not describe the present file state.
 
 ## Findings So Far
+- Tail-only shallow stage-5 fusion is not a safe extension of the wrap-root idea:
+- even though it drives `valu` much lower (`5922` tail-only, `5881` wrap+tail), both variants fail correctness.
+- Implication: after round `11`, shallow rounds still depend on bias state in a way that is not handled by the simple “consecutive full-bias prefix” model; wrap-root remains the only currently safe narrow stage-5 fusion.
 - A narrow overflow-to-root stage-5 fusion path is now the strongest architectural lead from this session:
 - `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` skips the stage-5 const only on round `10` (overflow), then repairs it in round `11`'s root XOR with no branch/index bias tracking.
 - It is correctness-valid and reduces real slot pressure to `valu=5982` and `alu=12099` (`12345 ops`), but still measures `1067` cycles.
@@ -88,6 +91,16 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-05: Tail-only shallow stage-5 fusion (`rounds 11..14`) and wrap+tail chain (`rounds 10..14`).
+- What changed/tested:
+- Added `ENABLE_TAIL_SHALLOW_STAGE5_FUSION` so the final shallow rounds can skip stage-5 const and rely only on shallow xor5/root fast paths (`depths 1..4`), with no scatter/mirror-base support.
+- Also tested the chained version with `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` so rounds `10..14` all skip consecutively.
+- Why: wrap-root fusion improved real slot counts safely, so the next hypothesis was that the final shallow-only tail could support additional consecutive skips without reintroducing deep scatter complexity.
+- Result:
+- `ENABLE_TAIL_SHALLOW_STAGE5_FUSION=True` -> `1066` cycles, fail, `12327` ops, slots `load=2003`, `valu=5922`, `alu=12146`.
+- `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` + `ENABLE_TAIL_SHALLOW_STAGE5_FUSION=True` -> `1108` cycles, fail, `12295` ops, slots `load=2003`, `valu=5881`, `alu=12218`.
+- Decision: keep the tail-fusion scaffolding disabled. The shallow tail still needs bias handling that this narrow fast-path model does not provide.
+
 - 2026-03-05: Specialized overflow-to-root stage-5 fusion.
 - What changed/tested:
 - Added `ENABLE_WRAP_ROOT_STAGE5_FUSION`, which skips stage-5 const only on the overflow round (`depth == forest_height`) and absorbs that const into the next round's root XOR using `tree_root_vec_xor5`, without enabling the full generic fusion/bias framework.

@@ -116,6 +116,10 @@ ENABLE_STAGE5_TREE_FUSION: bool = False
 # Special-case fusion for the overflow->root transition only: skip stage-5
 # const on the overflow round, then absorb it into the next round's root XOR.
 ENABLE_WRAP_ROOT_STAGE5_FUSION: bool = False
+# Special-case fusion for the final shallow tail: skip stage-5 const on the
+# last four pre-final rounds and compensate using the existing shallow
+# vselect/root fast paths only (no scatter/mirror-base support).
+ENABLE_TAIL_SHALLOW_STAGE5_FUSION: bool = False
 # Optional explicit round set for stage-5 const skipping when fusion is enabled.
 # Empty set keeps legacy behavior (skip stage-5 const on all non-final rounds).
 STAGE5_FUSION_SKIP_ROUNDS: set[int] = set()
@@ -1741,9 +1745,11 @@ class KernelBuilder:
     def _emit_setup(self, num_groups: int, forest_height: int) -> SetupRefs:
         """Emit all one-time setup ops. Returns typed SetupRefs."""
         V = VLEN
-        if ENABLE_STAGE5_TREE_FUSION and ENABLE_WRAP_ROOT_STAGE5_FUSION:
+        if ENABLE_STAGE5_TREE_FUSION and (
+            ENABLE_WRAP_ROOT_STAGE5_FUSION or ENABLE_TAIL_SHALLOW_STAGE5_FUSION
+        ):
             raise ValueError(
-                "ENABLE_WRAP_ROOT_STAGE5_FUSION cannot be combined with ENABLE_STAGE5_TREE_FUSION")
+                "Specialized stage-5 fusion flags cannot be combined with ENABLE_STAGE5_TREE_FUSION")
         if ENABLE_STAGE5_TREE_FUSION and DEPTH_5_VSELECT_GROUPS:
             # Depth-5 vselect path does not currently implement the
             # stage5-fusion biased/inverted source variants.
@@ -1798,7 +1804,11 @@ class KernelBuilder:
         tree_d1_left_vec_xor5: Ref | None = None
         tree_d1_right_vec_xor5: Ref | None = None
         const5: Ref | None = None
-        if ENABLE_STAGE5_TREE_FUSION or ENABLE_WRAP_ROOT_STAGE5_FUSION:
+        if (
+            ENABLE_STAGE5_TREE_FUSION
+            or ENABLE_WRAP_ROOT_STAGE5_FUSION
+            or ENABLE_TAIL_SHALLOW_STAGE5_FUSION
+        ):
             const5 = self.get_const(HASH_STAGES[5][1])
             tree_root_x5_scalar = self.emit(
                 "tree_root_x5_scalar", "alu",
@@ -1848,7 +1858,7 @@ class KernelBuilder:
             tree_d4_vec, tree_d4_diff = self._emit_depth4_setup(fvp)
 
         tree_mirror_base_vec: dict[int, Ref] = {}
-        if ENABLE_STAGE5_TREE_FUSION:
+        if ENABLE_STAGE5_TREE_FUSION or ENABLE_TAIL_SHALLOW_STAGE5_FUSION:
             if DELAY_DEPTH_4_SETUP:
                 raise ValueError(
                     "DELAY_DEPTH_4_SETUP is not supported with stage-5 fusion")
@@ -1890,8 +1900,21 @@ class KernelBuilder:
                         emit_odd_for_diff_pairs=bool(DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND)))
 
             if ENABLE_DEPTH_4_VSELECT:
+                d4_x5inv_lo_addr = self.emit(
+                    "tree_d4_x5inv_lo_addr", "alu",
+                    ("+", fvp, self.get_const(15)))
+                d4_x5inv_lo = self.emit(
+                    "tree_d4_x5inv_lo", "load",
+                    ("vload", d4_x5inv_lo_addr))
+                d4_x5inv_hi_addr = self.emit(
+                    "tree_d4_x5inv_hi_addr", "alu",
+                    ("+", fvp, self.get_const(23)))
+                d4_x5inv_hi = self.emit(
+                    "tree_d4_x5inv_hi", "load",
+                    ("vload", d4_x5inv_hi_addr))
                 d4_sources_inv = _bit_complement_permute(
-                    [(d4_lo, i) for i in range(8)] + [(d4_hi, i) for i in range(8)], 4)
+                    [(d4_x5inv_lo, i) for i in range(8)]
+                    + [(d4_x5inv_hi, i) for i in range(8)], 4)
                 if REVERSE_TREE_BIT_ORDER_DEPTH_4:
                     d4_sources_inv = _bit_reverse_permute(d4_sources_inv, 4)
                 d4_inv_pairs = len(d4_sources_inv) // 2
@@ -1903,17 +1926,18 @@ class KernelBuilder:
                         n_diff_pairs=d4_inv_diff_pairs, xor_const=const5,
                         emit_odd_for_diff_pairs=bool(DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND)))
 
-            # For scatter rounds under inverted branch semantics, convert
-            # mirrored per-depth indices into true node addresses in one op:
-            # addr = (tree_base + mirror_const(depth)) - mirrored_index.
-            for depth in range(3, forest_height + 1):
-                mirror_const = 3 * (1 << depth) - 1
-                mirror_base_s = self.emit(
-                    f"tree_mirror_base_s_{depth}", "alu",
-                    ("+", tree_base_1indexed_, self.get_const(mirror_const)))
-                tree_mirror_base_vec[depth] = self.emit(
-                    f"tree_mirror_base_v_{depth}", "valu",
-                    ("vbroadcast", mirror_base_s))
+            if ENABLE_STAGE5_TREE_FUSION:
+                # For scatter rounds under inverted branch semantics, convert
+                # mirrored per-depth indices into true node addresses in one op:
+                # addr = (tree_base + mirror_const(depth)) - mirrored_index.
+                for depth in range(3, forest_height + 1):
+                    mirror_const = 3 * (1 << depth) - 1
+                    mirror_base_s = self.emit(
+                        f"tree_mirror_base_s_{depth}", "alu",
+                        ("+", tree_base_1indexed_, self.get_const(mirror_const)))
+                    tree_mirror_base_vec[depth] = self.emit(
+                        f"tree_mirror_base_v_{depth}", "valu",
+                        ("vbroadcast", mirror_base_s))
 
         tree_d5_vec: dict[int, Ref] = {}
         tree_d5_diff: dict[int, Ref] = {}
@@ -2059,10 +2083,13 @@ class KernelBuilder:
         bit0, bit1, bit2, bit3, bit4 = ts.bits
         first_deps = start_deps or None
         bit_unbias_cache: dict[int, Ref] = {}
+        shallow_stage5_fusion = (
+            ENABLE_STAGE5_TREE_FUSION or ENABLE_TAIL_SHALLOW_STAGE5_FUSION
+        )
 
         def unbiased_bit(bit_ref: Ref | None, bit_depth: int) -> Ref:
             assert bit_ref is not None
-            if not (ENABLE_STAGE5_TREE_FUSION and (index_bias_mask & (1 << bit_depth))):
+            if not (shallow_stage5_fusion and (index_bias_mask & (1 << bit_depth))):
                 return bit_ref
             cached = bit_unbias_cache.get(bit_depth)
             if cached is not None:
@@ -2098,7 +2125,7 @@ class KernelBuilder:
 
         if depth == 1:
             full_bias = (index_bias_mask & 0b1) == 0b1
-            if (biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias):
+            if (biased_prev and shallow_stage5_fusion and full_bias):
                 d1_hi = s.tree_d1_left_vec_xor5 or s.tree_d1_left_vec
                 d1_lo = s.tree_d1_right_vec_xor5 or s.tree_d1_right_vec
                 select_bit0 = bit0
@@ -2110,7 +2137,7 @@ class KernelBuilder:
                 f"{prefix}_tree_select", "flow",
                 ("vselect", select_bit0, d1_hi, d1_lo),
                 deps=first_deps)
-            if biased_prev and ENABLE_STAGE5_TREE_FUSION and not full_bias:
+            if biased_prev and shallow_stage5_fusion and not full_bias:
                 nv = self.emit(
                     f"{prefix}_tree_select_bias_fix", "valu",
                     ("^", nv, s.hash_const1_vec[5]))
@@ -2123,7 +2150,7 @@ class KernelBuilder:
         if depth == 2:
             full_bias = (index_bias_mask & 0b11) == 0b11
             use_fast_bias = (
-                biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias and s.tree_d2_vec_xor5_inv
+                biased_prev and shallow_stage5_fusion and full_bias and s.tree_d2_vec_xor5_inv
             )
             d2_vec = s.tree_d2_vec_xor5_inv if use_fast_bias else s.tree_d2_vec
             b0 = bit0 if use_fast_bias else unbiased_bit(bit0, 0)
@@ -2144,7 +2171,7 @@ class KernelBuilder:
                 f"{prefix}_d2_select", "flow",
                 ("vselect", reduce_bit, sel1, sel0),
                 write_to=(sel0 if ENABLE_INPLACE_VSELECT_REDUCTION else None))
-            if biased_prev and ENABLE_STAGE5_TREE_FUSION and not use_fast_bias:
+            if biased_prev and shallow_stage5_fusion and not use_fast_bias:
                 nv = self.emit(
                     f"{prefix}_d2_select_bias_fix", "valu",
                     ("^", nv, s.hash_const1_vec[5]))
@@ -2158,11 +2185,11 @@ class KernelBuilder:
             d3_diff_pairs = self._depth_diff_pairs(3, rnd)
             full_bias = (index_bias_mask & 0b111) == 0b111
             use_fast_bias = (
-                biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias
+                biased_prev and shallow_stage5_fusion and full_bias
                 and s.tree_d3_diff_xor5_inv and s.tree_d3_vec_xor5_inv
             )
             use_late_d3 = (
-                not ENABLE_STAGE5_TREE_FUSION
+                not shallow_stage5_fusion
                 and rnd > 10
                 and bool(s.tree_d3_vec_late)
             )
@@ -2187,7 +2214,7 @@ class KernelBuilder:
                     prefix, 3, b2, d3_diff, d3_vec, [b1, b0],
                     start_deps=first_deps,
                     n_diff_pairs=d3_diff_pairs)
-            if biased_prev and ENABLE_STAGE5_TREE_FUSION and not use_fast_bias:
+            if biased_prev and shallow_stage5_fusion and not use_fast_bias:
                 nv = self.emit(
                     f"{prefix}_d3_select_bias_fix", "valu",
                     ("^", nv, s.hash_const1_vec[5]))
@@ -2201,11 +2228,11 @@ class KernelBuilder:
             d4_diff_pairs = self._depth_diff_pairs(4, rnd)
             full_bias = (index_bias_mask & 0b1111) == 0b1111
             use_fast_bias = (
-                biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias
+                biased_prev and shallow_stage5_fusion and full_bias
                 and s.tree_d4_diff_xor5_inv and s.tree_d4_vec_xor5_inv
             )
             use_late_d4 = (
-                not ENABLE_STAGE5_TREE_FUSION
+                not shallow_stage5_fusion
                 and rnd > 10
                 and bool(s.tree_d4_vec_late)
             )
@@ -2231,7 +2258,7 @@ class KernelBuilder:
                     prefix, 4, b3, d4_diff, d4_vec, [b2, b1, b0],
                     start_deps=first_deps,
                     n_diff_pairs=d4_diff_pairs)
-            if biased_prev and ENABLE_STAGE5_TREE_FUSION and not use_fast_bias:
+            if biased_prev and shallow_stage5_fusion and not use_fast_bias:
                 nv = self.emit(
                     f"{prefix}_d4_select_bias_fix", "valu",
                     ("^", nv, s.hash_const1_vec[5]))
@@ -2746,6 +2773,11 @@ class KernelBuilder:
                 if (ENABLE_WRAP_ROOT_STAGE5_FUSION
                         and rnd == forest_height
                         and rnd < rounds - 1):
+                    skip_stage5_const = True
+                elif (
+                    ENABLE_TAIL_SHALLOW_STAGE5_FUSION
+                    and (rounds - 5) <= rnd < (rounds - 1)
+                ):
                     skip_stage5_const = True
                 elif ENABLE_STAGE5_TREE_FUSION and rnd < rounds - 1:
                     if STAGE5_FUSION_SKIP_ROUNDS:
