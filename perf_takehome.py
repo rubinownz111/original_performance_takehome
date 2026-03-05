@@ -148,6 +148,9 @@ DEEP_GATE_WINDOW_BY_ROUND: dict[int, int] = {}
 # using round-end tokens. A value of 0 disables gating.
 ROUND_GATE_WINDOW_BY_ROUND: dict[int, int] = {7: 28, 9: 24, 10: 28}
 ROUND_GATE_WINDOW_BY_DEPTH: dict[int, int] = {}
+# Optional round set for releasing round-gate tokens after the round hash
+# instead of after the full branch/index tail.
+ROUND_GATE_RELEASE_AFTER_HASH_ROUNDS: set[int] = set()
 # Experimental: use tree result vectors directly as deep-gate tokens instead of
 # emitting scalar ALU token ops.
 USE_VECTOR_DEEP_TOKENS: bool = False
@@ -196,12 +199,19 @@ PREFER_FLOW_CONST: bool = False
 # Experimental: in scatter path, load all 8 node values into a vector and
 # combine with one vector XOR instead of 8 scalar ALU XORs.
 SCATTER_VECTOR_XOR: bool = False
+# When True, allow guarded ALU offload for fixed-destination scatter-vector
+# writeback variants now that retroactive write_to offload is supported.
+ALLOW_OFFLOAD_SCATTER_VEC_WRITEBACK: bool = False
 # When True, the scatter-vector combine overwrites the loaded scatter buffer
 # instead of allocating a fresh output vector.
 SCATTER_VECTOR_XOR_INPLACE: bool = False
+# Optional depth filters for inplace/write-to-values scatter-vector placement.
+# Empty means the corresponding placement toggle applies to all selected depths.
+SCATTER_VECTOR_XOR_INPLACE_DEPTHS: set[int] = set()
 # When True, the scatter-vector combine overwrites the live `values` vector
 # instead of materializing a separate result vector.
 SCATTER_VECTOR_XOR_WRITE_TO_VALUES: bool = False
+SCATTER_VECTOR_XOR_WRITE_TO_VALUES_DEPTHS: set[int] = set()
 # Optional filters for SCATTER_VECTOR_XOR. Empty means "all".
 SCATTER_VECTOR_XOR_DEPTHS: set[int] = set()
 SCATTER_VECTOR_XOR_GROUPS: set[int] = set()
@@ -217,6 +227,12 @@ RECOMPUTE_STORE_ADDR_AT_TAIL: bool = False
 # Derive `inp_values_ptr` from the loaded forest pointer and problem sizes
 # instead of spending a second header load on `mem[6]`.
 DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR: bool = False
+# Specialize the fixed `forest_values_ptr` header field (`mem[4] == 7`) into
+# compile-time constants instead of loading it from memory.
+SPECIALIZE_FOREST_VALUES_PTR: bool = False
+# Specialize the fixed `inp_values_ptr` header field into a compile-time
+# constant (`7 + n_nodes + batch_size`) instead of loading it or deriving it.
+SPECIALIZE_INPUT_VALUES_PTR: bool = False
 
 # Priority calculation scales
 CRITICAL_PATH_SCALE = 100.0
@@ -904,9 +920,9 @@ class Scheduler:
         """Check if a VALU op can be decomposed into scalar ALU ops."""
         if op.engine != "valu":
             return False
-        if "_scat_xor_vec_inplace" in op.id:
+        if "_scat_xor_vec_inplace" in op.id and not ALLOW_OFFLOAD_SCATTER_VEC_WRITEBACK:
             return False
-        if "_scat_xor_vec_to_values" in op.id:
+        if "_scat_xor_vec_to_values" in op.id and not ALLOW_OFFLOAD_SCATTER_VEC_WRITEBACK:
             return False
         if DISABLE_OFFLOAD_SCATTER_VEC_XOR and "_scat_xor_vec" in op.id:
             return False
@@ -1834,8 +1850,13 @@ class KernelBuilder:
         for stage in (0, 2, 4):
             self.get_const(1 + (1 << HASH_STAGES[stage][4]))
 
-        fvp = self.emit("header_forest_values_p", "load", ("load", self.get_const(4)))
-        if DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR:
+        if SPECIALIZE_FOREST_VALUES_PTR:
+            fvp = self.get_const(7)
+        else:
+            fvp = self.emit("header_forest_values_p", "load", ("load", self.get_const(4)))
+        if SPECIALIZE_INPUT_VALUES_PTR:
+            ivp = self.get_const(7 + n_nodes + batch_size)
+        elif DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR:
             ivp = self.emit(
                 "header_inp_values_p",
                 "flow",
@@ -1848,8 +1869,11 @@ class KernelBuilder:
         tree_vals_hi_addr = self.emit("tree_vals_hi_addr", "alu", ("+", fvp, const_V))
         tree_vals_hi = self.emit("tree_vals_hi", "load", ("vload", tree_vals_hi_addr))
 
-        tree_base_1indexed_ = self.emit(
-            "tree_base_1indexed_", "alu", ("-", fvp, const_one))
+        if SPECIALIZE_FOREST_VALUES_PTR:
+            tree_base_1indexed_ = self.get_const(6)
+        else:
+            tree_base_1indexed_ = self.emit(
+                "tree_base_1indexed_", "alu", ("-", fvp, const_one))
         tree_base_1indexed = self.emit(
             "tree_base_1indexed", "valu", ("vbroadcast", tree_base_1indexed_))
 
@@ -2386,12 +2410,27 @@ class KernelBuilder:
 
         if use_vec_scatter:
             assert scatter is not None
+            write_vec_to_values = (
+                SCATTER_VECTOR_XOR_WRITE_TO_VALUES
+                and (
+                    not SCATTER_VECTOR_XOR_WRITE_TO_VALUES_DEPTHS
+                    or depth in SCATTER_VECTOR_XOR_WRITE_TO_VALUES_DEPTHS
+                )
+            )
+            inplace_vec_scatter = (
+                SCATTER_VECTOR_XOR_INPLACE
+                and not write_vec_to_values
+                and (
+                    not SCATTER_VECTOR_XOR_INPLACE_DEPTHS
+                    or depth in SCATTER_VECTOR_XOR_INPLACE_DEPTHS
+                )
+            )
             for elem in range(V):
                 self.emit(
                     f"{prefix}_scat_load_{elem}", "load",
                     ("load", addr.with_offset(elem)),
                     write_to=scatter.with_offset(elem))
-            if SCATTER_VECTOR_XOR_WRITE_TO_VALUES:
+            if write_vec_to_values:
                 scatter_out = self.emit(
                     f"{prefix}_scat_xor_vec_to_values",
                     "valu",
@@ -2401,12 +2440,12 @@ class KernelBuilder:
                 scatter_out = self.emit(
                     (
                         f"{prefix}_scat_xor_vec_inplace"
-                        if SCATTER_VECTOR_XOR_INPLACE
+                        if inplace_vec_scatter
                         else f"{prefix}_scat_xor_vec"
                     ),
                     "valu",
                     ("^", scatter_values, scatter),
-                    write_to=(scatter if SCATTER_VECTOR_XOR_INPLACE else None))
+                    write_to=(scatter if inplace_vec_scatter else None))
             if biased_prev and ENABLE_STAGE5_TREE_FUSION:
                 return self.emit(
                     f"{prefix}_scat_bias_fix", "valu",
@@ -2881,6 +2920,19 @@ class KernelBuilder:
                     prefix, tree_values, s,
                     include_stage5_const=not skip_stage5_const,
                 )
+                if (
+                    rnd in ROUND_GATE_RELEASE_AFTER_HASH_ROUNDS
+                    and round_window > 0
+                    and (logical_g + round_window) < num_groups
+                ):
+                    round_tokens[rnd].append(
+                        self.emit(
+                            f"{prefix}_round_gate_token",
+                            "alu",
+                            ("+", s.const_zero, s.const_zero),
+                            deps=[values],
+                        )
+                    )
                 prev_stage5_skipped = skip_stage5_const
                 round_tail_refs: list[Ref] = [values]
 
@@ -2902,7 +2954,11 @@ class KernelBuilder:
                     if new_index_ref is not None:
                         round_tail_refs.append(new_index_ref)
 
-                if round_window > 0 and (logical_g + round_window) < num_groups:
+                if (
+                    rnd not in ROUND_GATE_RELEASE_AFTER_HASH_ROUNDS
+                    and round_window > 0
+                    and (logical_g + round_window) < num_groups
+                ):
                     round_tokens[rnd].append(
                         self.emit(
                             f"{prefix}_round_gate_token",

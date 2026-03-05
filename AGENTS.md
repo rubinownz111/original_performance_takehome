@@ -123,6 +123,13 @@
 - The selective stage-5 branch-hint path still loses:
 - limiting the branch-hint rewrite to the exact reopened vector-scatter rounds (`round 5` alone, or `rounds 5/6`) reduced the blow-up versus the global version, but the best point still regressed to `1068`.
 - Implication: the extra offloadable parity/equality ops cost more than the tail overlap they recover; this branch-bit fusion family is not competitive on the current scheduler/ISA.
+- New strongest architecture on the branch after all of that:
+- per-depth vector-scatter placement matters. The mixed layout `depth 5 -> write_to_values`, `depth 6 -> plain combine` is the first reopened vector-scatter family that gets back to the current `1065` baseline while keeping materially lower static pressure:
+- `11699 ops`, `load=1999`, `flow=786`, `alu=11834`, `valu=6013`, `store=32`, peak scratch `1496/1536`.
+- Implication: depth-5 and depth-6 do not want the same vector-scatter placement; the remaining gap to sub-`1065` is now a small follow-up around this mixed family rather than around the old uniform-placement variants.
+- Narrow setup specialization interacts differently with the reopened families than it did on baseline:
+- specializing `forest_values_ptr` and `inp_values_ptr` directly is still terrible on baseline (`1070`), but on the reopened vector-scatter families it consistently removes one more real load (`1999`) and can pull ALU well below `12000` without losing correctness.
+- Implication: future work should continue to evaluate setup specialization only together with the reopened vector-scatter architecture, not in isolation.
 - Deep tree traversal is the main load hotspot:
 - Depths `5-10` use scatter path and contribute most scalar `load`+`alu` tree ops.
 - New allocator/scheduler finding on the hash-temp reuse path:
@@ -144,6 +151,60 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-05: Mixed depth-5/depth-6 vector-scatter placement.
+- What changed/tested:
+- Added depth-filtered vector-scatter placement controls so depth-5 and depth-6 can choose different combine destinations.
+- Tested the two asymmetric layouts on the reopened vector-scatter family with:
+- specialized header pointers
+- wrap-root fusion
+- full tree/hash/scatter writeback
+- hash temp reuse
+- no round gates
+- Why: depth 5 sits on the first deep-round transition, while depth 6 is a later heavy-load round; forcing both to use the same vector-scatter placement was likely over-constraining the architecture.
+- Result:
+- `depth 5 -> write_to_values`, `depth 6 -> plain` -> correctness pass, `1065` cycles, `11699` ops, slots `load=1999`, `flow=786`, `alu=11834`, `valu=6013`, `store=32`, peak scratch `1496/1536`.
+- `depth 5 -> plain`, `depth 6 -> write_to_values` -> `1070` cycles, `11699` ops, `alu=11866`, `valu=6009`.
+- Decision: keep the per-depth placement scaffolding. The `d5->values / d6->plain` mix is now the strongest correctness-valid architecture on the branch, even though it only ties baseline so far.
+
+- 2026-03-05: Follow-ups around the tied mixed-placement family.
+- What changed/tested:
+- Tested the strongest mixed family with:
+- `ROUND_GATE_WINDOW_BY_ROUND={5:28}`
+- `ROUND_GATE_WINDOW_BY_ROUND={7:28,9:24,10:28}`
+- `SCATTER_VECTOR_XOR_INPLACE_DEPTHS={6}`
+- slightly lower `MAX_CONCURRENT_GROUPS` (`18`, `16`)
+- adjacent round-5 gate widths (`29`, `30`)
+- guarded ALU offload enabled for scatter writeback variants
+- `ROUND_GATE_RELEASE_AFTER_HASH_ROUNDS={5}`
+- Why: once the mixed family tied baseline, the next step was a very small set of follow-ups around its overlap shape rather than a fresh broad rewrite.
+- Result:
+- `gate {5:28}` -> `1067`, `alu=11838`, `valu=6013`.
+- baseline gate map `{7:28,9:24,10:28}` -> `1067`, `alu=11962`, `valu=5999`.
+- `depth6 inplace` -> `1070`.
+- `MAX_CONCURRENT_GROUPS=18` -> `1171`; `16` -> `1200`.
+- `gate {5:29}` / `{5:30}` -> both `1067`.
+- Allowing guarded offload on the depth-5 writeback combine:
+- no gates -> `1067`, `alu=11970`, `valu=5996`
+- with `gate {5:28}` -> `1065`, `alu=11894`, `valu=6006`
+- adding `ROUND_GATE_RELEASE_AFTER_HASH_ROUNDS={5}` on top of that still stayed `1065`.
+- Decision: keep the new scaffolding, but none of these local overlap tweaks beats the tied mixed family.
+
+- 2026-03-05: Re-testing setup specialization and depth-local vector scatter around the reopened family.
+- What changed/tested:
+- Added `SPECIALIZE_FOREST_VALUES_PTR` and `SPECIALIZE_INPUT_VALUES_PTR` scaffolding and tested them only on reopened vector-scatter families.
+- Also tested deeper-only vector-scatter activation (`depth 6` only, `depth 7` only, `depths 6+7`) and a one-group depth-5 vselect hybrid on top of the strongest depth-5 vector-scatter family.
+- Why: once the reopened family got close, the next logical move was to remove one more setup load or shave a little more deep-round load locally without paying the full historical vselect penalty.
+- Result:
+- `SPECIALIZE_FOREST_VALUES_PTR=True` on the strongest depth-5 family -> `1067`, `load=1999`, `alu=11986`, `valu=5996`, `flow=786`.
+- `SPECIALIZE_FOREST_VALUES_PTR=True` on plain baseline -> `1070`.
+- `SPECIALIZE_FOREST_VALUES_PTR=True` + `SPECIALIZE_INPUT_VALUES_PTR=True` on the same depth-5 family -> still `1067`, `load=1999`, `alu=11978`, `valu=5997`.
+- `depth 6` only vector scatter -> `1067`, `load=2000`, `alu=12051`, `valu=5986`.
+- `depth 7` only -> `1072`; `depths 6+7` -> `1072`.
+- One-group delayed depth-5 vselect hybrid on top of the strongest depth-5 vector-scatter family:
+- `g=27` -> `1070`, `load=1996`, `flow=806`, `valu=6028`
+- `g=30` -> `1071`.
+- Decision: keep the pointer-specialization scaffolding because it improves the reopened families even though it hurts baseline; reject the one-group depth-5 hybrid and deeper-only vector-scatter variants as non-winning follow-ups.
+
 - 2026-03-05: Selective early stage-5 branch-bit fusion.
 - What changed/tested:
 - Added a new branch-hint path that derives the next branch bit from stage-5 intermediates (`stage4_value` and `stage4_value >> 16`) instead of waiting for the final hash output.
