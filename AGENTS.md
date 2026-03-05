@@ -70,6 +70,39 @@
 - `defer_valu_full: 10534`
 - `defer_flow_full: 4323`
 - `defer_valu_full_offload_failed: 2917`
+- Round-window token release cannot simply move to tree completion on the current `1065` branch:
+- making rounds `7/9/10` release on `tree_values` instead of full round-tail completion lowers peak scratch materially (`1528 -> 1448`) and trims emitted ALU slots (`12122 -> 12066`), but it still regresses to `1072` cycles with `valu` slightly higher (`6017`).
+- Implication: the current round gates are not just smoothing deep-load overlap; they are also protecting later hash/index overlap enough that earlier release loses more VALU critical-path slack than it gains from lower scratch/ALU pressure.
+- A narrow setup rewrite can now hit the load lower-bound threshold without helping cycles:
+- deriving `inp_values_ptr` from the loaded forest pointer removes one real load (`2001 -> 2000`) and, when combined with wrap-root stage-5 fusion, also drives `valu=5986` and `alu=12067`, but the kernel still measures `1067` cycles.
+- Implication: simply nudging static slot totals below the obvious `load`/`valu` thresholds is not sufficient on this branch; the remaining gap is still dominated by schedule overlap and critical-path shape.
+- New hash-direction lead from the current telemetry:
+- stage 1 and stage 5 are the remaining temp-heavy hash combines on the critical path (`2 shifts + 5 xor-family vector ops` per group/round around the hash tail), and unlike fresh-temp reuse they can potentially write back into the already-mapped live `values` block.
+- Implication: a narrow “stage1/stage5 combine-to-values” rewrite is the smallest hash dataflow change that could cut hash scratch/liveness without reintroducing the full temp-reuse allocator failure mode.
+- New tree-direction lead now visible in existing scaffolding:
+- `ENABLE_INPLACE_TREE_XOR_DATAFLOW` has not been exercised on the current `1065` branch, and unlike the failed full in-place vector chain it only overwrites `values` at the tree-output boundary while leaving hash SSA intact.
+- Implication: combining shallow tree-xor in-place writes with the already-safe deep scalar scatter-to-values rewrite may be the cleanest remaining “all tree outputs write back to values” architecture to test without reopening the hash allocator alias problem.
+- New constraint from the latest in-place writeback attempts:
+- even correctness-valid writeback rewrites on offloadable vector ops (`hash` xor/shift combines, shallow `tree_xor`) tend to reduce emitted ALU slots but raise VALU slots enough to regress, which strongly suggests the current schedule benefits from retroactive/current-cycle ALU offload that these fixed-destination writes partially suppress.
+- Implication: future dataflow rewrites should avoid `write_to` on offloadable vector ops unless they also preserve a comparable ALU-offload path.
+- New scheduler/allocator lead from that constraint:
+- retroactive ALU offload currently rejects full-vector `write_to` ops whenever the destination block is already mapped, even in cases where the overwritten block has no remaining readers beyond the current op and the past bundles do not touch that block.
+- Implication: enabling a guarded “reuse existing mapped destination for retro-offload” path may be the key to making narrow in-place tree/hash rewrites competitive instead of VALU-regressive.
+- Guarded retro-offload reuse for mapped `write_to` vectors is now validated:
+- when the overwritten vector block has no remaining readers beyond the current op and the candidate past bundles do not touch that block, reusing the existing mapped destination for retroactive ALU offload restores the lost ALU-relief path without changing baseline behavior.
+- Immediate impact on blocked writeback paths:
+- `REUSE_HASH_COMBINE_TEMPS=True` is now correctness-valid again at `1065` cycles.
+- `ENABLE_INPLACE_HASH_DATAFLOW=True` is also correctness-valid at `1065`.
+- Prior regressive but correctness-valid writeback rewrites (`INPLACE_HASH_OUTPUT_STAGES={1,5}`, `ENABLE_INPLACE_TREE_XOR_DATAFLOW`, and the full-tree writeback combination) all snap back from `1070-1074` to baseline-neutral `1065`.
+- Implication: the writeback-family blocker on this branch was primarily scheduler offload support, not the emitted mathematical graph. These paths are now usable scaffolding again, but they still have not produced a cycle win on their own.
+- New strongest near-win after the scheduler fix:
+- depth-5 vector scatter combined with wrap-root stage-5 fusion and the full writeback chain reaches `1067` with the best current emitted slot shape seen on this branch:
+- `load=2001`, `alu=12011`, `valu=5993`, `flow=785`, `store=32`, `11909 ops`, peak scratch `1472/1536`.
+- Implication: this family is now one real load and roughly one ALU bundle away from the hard lower-bound targets, making the previously regressive setup-side `load -> flow` rewrite worth re-testing only against this exact composition.
+- Strongest current slot-shape after that follow-up:
+- adding the narrow pointer-derivation rewrite on top of the same depth-5 vector-scatter family reaches `load=2000`, `alu=12003`, `valu=5994`, `flow=785`, `store=32`, `11908 ops`, but still measures `1067` cycles.
+- Extending vector scatter to depths `{5,6}` can push ALU fully below the old `12000` target (`alu=11955`, `load=2000`, `valu=6000`), yet still remains at `1068`.
+- Implication: this reopened vector-scatter family is no longer blocked by static slot counts alone; its remaining cap is schedule overlap / dependency shape, not just raw `load` or `alu` totals.
 - Deep tree traversal is the main load hotspot:
 - Depths `5-10` use scatter path and contribute most scalar `load`+`alu` tree ops.
 - New allocator/scheduler finding on the hash-temp reuse path:
@@ -91,6 +124,120 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-05: Reopened delayed depth-5 near-miss under the scheduler offload fix.
+- What changed/tested:
+- Re-tested the historical delayed depth-5 near-miss config:
+- `DEPTH_5_VSELECT_GROUPS={27}`
+- `DEPTH_5_VSELECT_DIFF_PAIRS=12`
+- `DELAY_DEPTH_5_SETUP=True`
+- `ROUND_GATE_WINDOW_BY_ROUND={}`
+- `DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND={3:4,14:3}`
+- `DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND={4:1,15:1}`
+- Then combined it with:
+- `ENABLE_WRAP_ROOT_STAGE5_FUSION=True`
+- full writeback chain (`ENABLE_INPLACE_TREE_XOR_DATAFLOW=True`, `ENABLE_INPLACE_HASH_DATAFLOW=True`, `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True`)
+- and the two known best round-gate maps.
+- Why: the scheduler fix made writeback paths allocator-safe, so this was the most likely previously blocked `1067` family to convert lower scratch into real cycles.
+- Result:
+- Historical config re-validates exactly at `1067` with `load=1997`, `flow=834`, `alu=12129`, `valu=6023`.
+- Adding wrap-root alone regressed to `1070` (`alu=12114`, `valu=5994`).
+- Adding full writeback chain recovered part of that loss to `1068` (`12152 ops`, peak scratch `1478/1536`) but still did not beat baseline.
+- Re-introducing round gates made it worse (`1071-1072`).
+- Decision: keep this family as a dead end for cycle reduction on the current branch. The load savings survive, but the added flow pressure still dominates.
+
+- 2026-03-05: Depth-5 vector scatter + wrap-root + writeback family.
+- What changed/tested:
+- Combined:
+- `SCATTER_VECTOR_XOR=True`
+- depth filters on heavy rounds (`SCATTER_VECTOR_XOR_DEPTHS={5}`, then `{5,6}`, then `{5,6,7}`)
+- wrap-root fusion (`ENABLE_WRAP_ROOT_STAGE5_FUSION=True`)
+- full writeback chain (`ENABLE_INPLACE_TREE_XOR_DATAFLOW=True`, `ENABLE_INPLACE_HASH_DATAFLOW=True`, `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True`)
+- and re-tested the narrow pointer-derivation setup rewrite (`DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR=True`) against this family only.
+- Also checked combine placement variants (`plain`, `write_to_values`, `inplace`) and no-gate overlap variants where they were logically relevant.
+- Why: this is the first current-branch family where the scheduler fix plus writeback support materially changes the viable slot tradeoff, so it became the best shot at a real sub-`1065` win.
+- Result:
+- `depth {5}`, wrap-root, write-to-values, full writeback -> `1067`, `11909 ops`, `load=2001`, `alu=12011`, `valu=5993`, peak scratch `1472/1536`.
+- Adding pointer derivation on that exact point -> `1067`, `11908 ops`, `load=2000`, `alu=12003`, `valu=5994`, `flow=785`, peak scratch unchanged.
+- `depth {5,6}`, write-to-values -> `1068`, `11716 ops`, `load=2000`, `alu=11955`, `valu=6000`.
+- `depth {5,6}`, plain combine, no gates -> `1067`, `11700 ops`, `load=2000`, `alu=12011`, `valu=5991`, `flow=785`, peak scratch `1464/1536`.
+- `depth {5,6,7}`, plain combine, no gates -> `1068`, `11508 ops`, `load=2000`, `alu=11907`, `valu=6004`.
+- Targeted low-VALU rebalance on that last point (`DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND={4:1,15:1}`) was catastrophic despite better slot totals: `1093` cycles, `flow=813`, `alu=11938`, `valu=5971`.
+- Decision: keep the vector-scatter scaffolding disabled. This family now achieves the strongest slot shapes seen on the branch, but it still cannot convert them into a cycle win; the remaining limiter is overlap / dependency shape rather than emitted slot totals alone.
+
+- 2026-03-05: Guarded retroactive ALU offload for fixed-destination vector writes.
+- What changed/tested:
+- Added op-level `write_to` ownership tracking and taught retroactive ALU offload to reuse an already-mapped destination block when:
+- the op is a full-vector `write_to`
+- the overwritten block has no remaining readers beyond the current op
+- and the candidate past bundles do not touch that physical block.
+- Re-tested the previously blocked writeback families:
+- `REUSE_HASH_COMBINE_TEMPS=True`
+- `ENABLE_INPLACE_HASH_DATAFLOW=True`
+- `INPLACE_HASH_OUTPUT_STAGES={1,5}`
+- `ENABLE_INPLACE_TREE_XOR_DATAFLOW=True` with and without `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True`
+- Why: the recent regressions strongly indicated that fixed-destination writebacks were losing the scheduler’s retroactive ALU-offload path; this change restores that path only when it is provably safe.
+- Result:
+- Baseline remains unchanged at `1065` cycles and passes correctness.
+- `REUSE_HASH_COMBINE_TEMPS=True` -> correctness pass, `1065` cycles, `12375` ops, baseline slot totals.
+- `ENABLE_INPLACE_HASH_DATAFLOW=True` -> correctness pass, `1065` cycles, `12375` ops, baseline slot totals.
+- `INPLACE_HASH_OUTPUT_STAGES={1,5}` -> build/schedule returns to `1065` with baseline slot totals (previously `1070` / `alu=11946` / `valu=6032`).
+- `ENABLE_INPLACE_TREE_XOR_DATAFLOW=True` + `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True` -> build/schedule returns to `1065` with `12131` ops and baseline slot totals (previously `1074` / `alu=11498` / `valu=6088`).
+- `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` + full writeback chain still remains `1067` (`12101` ops, `alu=12083`, `valu=5984`), so the restored offload path does not by itself convert the best wrap-root architecture into a cycle win.
+- Decision: keep the scheduler fix. It resolves a real allocator/offload limitation and reopens previously blocked hash/tree writeback scaffolds, even though none of the re-tested paths beat the `1065` baseline yet.
+
+- 2026-03-05: Stage-1 / stage-5 hash combine writes back into `values`.
+- What changed/tested:
+- Added `INPLACE_HASH_OUTPUT_STAGES` so selected hash stages can overwrite the live `values` vector without enabling the full in-place hash chain.
+- Tested the intended target `INPLACE_HASH_OUTPUT_STAGES={1,5}` and then split it into `{1}` and `{5}` to localize the effect.
+- Why: stage 1 and stage 5 are the remaining temp-heavy xor/shift hash combines; this was the smallest hash dataflow rewrite that could cut scratch/liveness without re-entering the full temp-reuse alias failure.
+- Result:
+- `INPLACE_HASH_OUTPUT_STAGES={1,5}` -> correctness pass, `1070` cycles, `12375` ops, slots `load=2001`, `flow=785`, `alu=11946`, `valu=6032`, `store=32`, peak scratch `1521/1536`.
+- `INPLACE_HASH_OUTPUT_STAGES={1}` -> `1070` cycles, build/schedule telemetry only, slots `alu=12002`, `valu=6025`.
+- `INPLACE_HASH_OUTPUT_STAGES={5}` -> `1070` cycles, build/schedule telemetry only, slots `alu=12010`, `valu=6024`.
+- Decision: keep disabled. The rewrite is correctness-valid, but it shifts too much work back onto VALU and loses `5` cycles.
+
+- 2026-03-05: Tree-output writes back into `values`.
+- What changed/tested:
+- Exercised existing `ENABLE_INPLACE_TREE_XOR_DATAFLOW` scaffolding for shallow tree outputs.
+- Also tested the natural full-tree follow-up with `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True` so both shallow and deep tree outputs write back into `values`.
+- Why: this is the narrowest remaining “all tree outputs in place” architecture that avoids the failed full in-place hash chain.
+- Result:
+- `ENABLE_INPLACE_TREE_XOR_DATAFLOW=True` -> correctness pass, `1074` cycles, `12375` ops, slots `load=2001`, `flow=785`, `alu=11498`, `valu=6088`, `store=32`, peak scratch `1527/1536`.
+- `ENABLE_INPLACE_TREE_XOR_DATAFLOW=True` + `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True` -> correctness pass, `1074` cycles, `12131` ops, identical slot totals `load=2001`, `flow=785`, `alu=11498`, `valu=6088`, `store=32`, peak scratch `1495/1536`.
+- Decision: keep both disabled for this path. These rewrites remove graph scaffolding and lower ALU, but they block enough useful ALU offload that VALU rises sharply and the schedule regresses by `9` cycles.
+
+- 2026-03-05: Header `inp_values_ptr` derivation from forest pointer.
+- What changed/tested:
+- Added `DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR` so setup can compute `inp_values_ptr` as `forest_values_ptr + n_nodes + batch_size` via `flow/add_imm` instead of loading `mem[6]`.
+- Also tested the most logical companions:
+- with `ENABLE_WRAP_ROOT_STAGE5_FUSION=True`
+- with `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` and `ROUND_GATE_RELEASE_AFTER_HASH=True`
+- Why: remove exactly one real load from the kernel while preserving the dynamic memory-layout anchor (`mem[4]`), avoiding the broader liveness cost of the older full compile-time header specialization.
+- Result:
+- `DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR=True` -> `1070` cycles, pass, `12374` ops, slots `load=2000`, `flow=785`, `alu=12082`, `valu=6015`, `store=32`, peak scratch `1481/1536`.
+- `DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR=True` + `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` -> `1067` cycles, pass, `12344` ops, slots `load=2000`, `flow=785`, `alu=12067`, `valu=5986`, `store=32`, peak scratch `1520/1536`.
+- `DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR=True` + `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` + `ROUND_GATE_RELEASE_AFTER_HASH=True` -> `1067` cycles, pass, `12344` ops, same slot totals as the wrap-root companion.
+- Decision: keep disabled / revert. This is the first current-branch path to hit `load=2000`, but it still does not convert into a cycle win even when paired with the best known overflow fusion.
+
+- 2026-03-05: Round-window token release on hash completion.
+- What changed/tested:
+- Added `ROUND_GATE_RELEASE_AFTER_HASH` so the existing round-window gates (`7/9/10`) can release after the round hash finishes, instead of waiting for branch-bit/index tail work.
+- Also tested the natural companion with `ENABLE_WRAP_ROOT_STAGE5_FUSION=True`.
+- Why: the tree-completion release was too aggressive, so the next hypothesis was that gating only through the hash would preserve most of the overlap protection while still freeing the small index-update tail.
+- Result:
+- `ROUND_GATE_RELEASE_AFTER_HASH=True` -> `1068` cycles, pass, `12375` ops, slots `load=2001`, `flow=785`, `alu=12170`, `valu=6004`, `store=32`, peak scratch `1528/1536`.
+- `ROUND_GATE_RELEASE_AFTER_HASH=True` + `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` -> `1067` cycles, pass, `12345` ops, slots `load=2001`, `flow=785`, `alu=12091`, `valu=5983`, `store=32`, peak scratch `1456/1536`.
+- Decision: keep disabled / revert. Releasing only the branch/index tail is much less harmful than full tree-completion release, but it still does not beat baseline.
+
+- 2026-03-05: Round-window token release on tree completion.
+- What changed/tested:
+- Added `ROUND_GATE_RELEASE_ON_TREE_DONE` so the existing round-window gates (`7/9/10`) can release their scalar token immediately after `tree_values` instead of after the full round tail (`hash` + index-update).
+- Kept the active round-window map unchanged and tested the feature in isolation.
+- Why: the current gates exist to cap deep scatter-load overlap, so the hypothesis was that later groups could start their tree work sooner while prior groups finished the trailing hash/index work in parallel.
+- Result:
+- `ROUND_GATE_RELEASE_ON_TREE_DONE=True` -> `1072` cycles, pass, `12375` ops, slots `load=2001`, `flow=785`, `alu=12066`, `valu=6017`, `store=32`, peak scratch `1448/1536`.
+- Decision: keep disabled. Earlier gate release improves scratch and ALU pressure, but it hurts overall overlap enough to lose `7` cycles.
+
 - 2026-03-05: Tail-only shallow stage-5 fusion (`rounds 11..14`) and wrap+tail chain (`rounds 10..14`).
 - What changed/tested:
 - Added `ENABLE_TAIL_SHALLOW_STAGE5_FUSION` so the final shallow rounds can skip stage-5 const and rely only on shallow xor5/root fast paths (`depths 1..4`), with no scatter/mirror-base support.
@@ -742,6 +889,8 @@
 - Tree scatter remains the largest reducible pool: `1952` scalar scatter loads and `1952` scalar scatter XOR ALU ops total.
 - Deep scatter depths `5..10` account for `1536` of those loads and `1536` of those ALU XORs (32 groups across 6 rounds), while residual depth-3/4 scatter accounts for the remaining `416 + 416`.
 - Hash remains the other major structural pressure source with `5632` hash-family ops across rounds, so materially lower cycles likely still require a real hash VALU reduction in addition to scatter relief.
+- Round-window gating on the current `1065` baseline is still tied to full round-tail completion (`hash` + index-update), even on the load-heavy deep rounds `7/9/10` where the actual intent is to cap only deep-tree/scatter overlap.
+- New architectural lead worth testing next: release round-window tokens at tree-completion instead of full round-tail completion so later groups can overlap the trailing hash/index work while keeping the same deep-load concurrency cap.
 - Decision: treat scheduler/gating retunes as exhausted for now; next winning paths should target deep-scatter structural reduction first, with hash-stage fusion as the parallel second candidate.
 
 - 2026-03-05: Delayed depth-5 vselect setup architecture.

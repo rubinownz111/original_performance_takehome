@@ -159,6 +159,9 @@ ENABLE_INPLACE_HASH_DATAFLOW: bool = False
 # Narrower hash in-place path: only stage-0 and stage-4 `multiply_add` ops
 # overwrite the live values vector, leaving the temp-heavy combine stages in SSA.
 ENABLE_INPLACE_HASH_MULADD_ONLY: bool = False
+# Optional hash stages whose final output may overwrite the live `values`
+# vector, without enabling the full in-place hash chain.
+INPLACE_HASH_OUTPUT_STAGES: set[int] = set()
 # Write deep scalar scatter results directly back into the live `values`
 # vector lane-by-lane instead of allocating a separate output vector.
 ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES: bool = False
@@ -211,6 +214,9 @@ USE_IMMEDIATE_GROUP_LOAD_ADDR: bool = False
 # Recompute per-group store address near the final vstore instead of keeping
 # the initial load address live across all rounds.
 RECOMPUTE_STORE_ADDR_AT_TAIL: bool = False
+# Derive `inp_values_ptr` from the loaded forest pointer and problem sizes
+# instead of spending a second header load on `mem[6]`.
+DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR: bool = False
 
 # Priority calculation scales
 CRITICAL_PATH_SCALE = 100.0
@@ -545,7 +551,7 @@ def slot_to_tuple(s: Slot) -> tuple:
 class Op:
     """One instruction in the dependency graph, before scheduling."""
 
-    __slots__ = ["id", "engine", "slot", "deps", "write_size", "vbase"]
+    __slots__ = ["id", "engine", "slot", "deps", "write_size", "vbase", "write_to_vid"]
 
     def __init__(
         self,
@@ -554,6 +560,7 @@ class Op:
         deps: list[str] | None = None,
         write_size: int = 0,
         vbase: int = -1,
+        write_to_vid: str | None = None,
     ) -> None:
         self.id = id
         self.engine: str = slot_engine(slot)
@@ -561,6 +568,7 @@ class Op:
         self.deps: list[str] = deps or []
         self.write_size = write_size
         self.vbase = vbase
+        self.write_to_vid = write_to_vid
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -934,6 +942,34 @@ class Scheduler:
                             addrs.add(val)
         return addrs
 
+    def _can_retro_offload_existing_write_to(
+        self,
+        op: Op,
+        used_addrs: set[int],
+    ) -> bool:
+        """Whether a full-vector write_to op can reuse its existing mapped
+        destination block for retroactive ALU offload.
+
+        This is only safe when the overwritten block has no remaining readers
+        beyond *op* itself and the candidate past bundles do not touch the
+        destination addresses.
+        """
+        write_to_vid = op.write_to_vid
+        if write_to_vid is None or op.write_size != self.V or op.vbase < 0:
+            return False
+
+        alloc = self.allocator
+        if op.vbase not in alloc.vmap:
+            return False
+        if self.remaining_readers.get(write_to_vid, 0) != 1:
+            return False
+
+        dest_block = {
+            alloc.vmap[op.vbase + k]
+            for k in range(op.write_size)
+        }
+        return not (dest_block & used_addrs)
+
     def _alloc_safe_vector(self, op: Op, used_addrs: set[int]) -> bool:
         """Allocate a vector block from the free list, choosing one
         whose addresses don't overlap with *used_addrs*.
@@ -1042,7 +1078,9 @@ class Scheduler:
 
         if n_past > 0:
             used = self._collect_bundle_addrs(result[-n_past:])
-            if not self._alloc_safe_vector(op, used):
+            if self._can_retro_offload_existing_write_to(op, used):
+                self.allocator.alloc_for_op(op)
+            elif not self._alloc_safe_vector(op, used):
                 return None
         else:
             self.allocator.alloc_for_op(op)
@@ -1505,7 +1543,16 @@ class KernelBuilder:
 
         vbase = dest_vaddr if dest_vaddr is not None else -1
 
-        self.ops.append(Op(vid, slot, unique_deps, write_size, vbase))
+        self.ops.append(
+            Op(
+                vid,
+                slot,
+                unique_deps,
+                write_size,
+                vbase,
+                write_to_vid=(write_to.vid if write_to is not None else None),
+            )
+        )
         return Ref(vid)
 
     @staticmethod
@@ -1742,7 +1789,13 @@ class KernelBuilder:
             emit_odd_for_diff_pairs=bool(DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND),
             deps=deps)
 
-    def _emit_setup(self, num_groups: int, forest_height: int) -> SetupRefs:
+    def _emit_setup(
+        self,
+        num_groups: int,
+        forest_height: int,
+        n_nodes: int,
+        batch_size: int,
+    ) -> SetupRefs:
         """Emit all one-time setup ops. Returns typed SetupRefs."""
         V = VLEN
         if ENABLE_STAGE5_TREE_FUSION and (
@@ -1783,7 +1836,14 @@ class KernelBuilder:
             self.get_const(1 + (1 << HASH_STAGES[stage][4]))
 
         fvp = self.emit("header_forest_values_p", "load", ("load", self.get_const(4)))
-        ivp = self.emit("header_inp_values_p", "load", ("load", self.get_const(6)))
+        if DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR:
+            ivp = self.emit(
+                "header_inp_values_p",
+                "flow",
+                ("add_imm", fvp, n_nodes + batch_size),
+            )
+        else:
+            ivp = self.emit("header_inp_values_p", "load", ("load", self.get_const(6)))
 
         tree_vals_lo = self.emit("tree_vals_lo", "load", ("vload", fvp))
         tree_vals_hi_addr = self.emit("tree_vals_hi_addr", "alu", ("+", fvp, const_V))
@@ -2391,6 +2451,14 @@ class KernelBuilder:
     ) -> Ref:
         """Emit the 6-stage hash. Returns updated values Ref."""
         use_inplace = ENABLE_INPLACE_VECTOR_DATAFLOW or ENABLE_INPLACE_HASH_DATAFLOW
+
+        def write_hash_output_to_values(stage_idx: int) -> bool:
+            return (
+                use_inplace
+                or (stage_idx in INPLACE_HASH_OUTPUT_STAGES)
+                or (stage_idx in (0, 4) and ENABLE_INPLACE_HASH_MULADD_ONLY)
+            )
+
         def reuse_stage(stage_idx: int) -> bool:
             return (
                 REUSE_HASH_COMBINE_TEMPS
@@ -2418,7 +2486,7 @@ class KernelBuilder:
                         f"{prefix}_hash23_combine", "valu",
                         ("^", ha, hb),
                         write_to=ha)
-                elif use_inplace:
+                elif write_hash_output_to_values(stage):
                     values = self.emit(
                         f"{prefix}_hash23_combine", "valu",
                         ("^", ha, hb),
@@ -2430,7 +2498,7 @@ class KernelBuilder:
             elif stage == 3:
                 continue  # handled in stage 2
             elif stage in (0, 4):
-                if use_inplace or ENABLE_INPLACE_HASH_MULADD_ONLY:
+                if write_hash_output_to_values(stage):
                     values = self.emit(
                         f"{prefix}_hash{stage}", "valu",
                         ("multiply_add", values,
@@ -2453,7 +2521,7 @@ class KernelBuilder:
                             f"{prefix}_hash{stage}_combine", "valu",
                             (op2, values, hb),
                             write_to=hb)
-                    elif use_inplace:
+                    elif write_hash_output_to_values(stage):
                         values = self.emit(
                             f"{prefix}_hash{stage}_combine", "valu",
                             (op2, values, hb),
@@ -2471,7 +2539,7 @@ class KernelBuilder:
                         f"{prefix}_hash{stage}_combine", "valu",
                         (op2, ha, hb),
                         write_to=ha)
-                elif use_inplace:
+                elif write_hash_output_to_values(stage):
                     values = self.emit(
                         f"{prefix}_hash{stage}_combine", "valu",
                         (op2, ha, hb),
@@ -2606,7 +2674,7 @@ class KernelBuilder:
 
         round_depths = [self._round_depth(rnd, forest_height) for rnd in range(rounds)]
 
-        s = self._emit_setup(num_groups, forest_height)
+        s = self._emit_setup(num_groups, forest_height, n_nodes, batch_size)
 
         completed_stores: list[Ref] = []
         deep_round_tokens: dict[int, list[Ref]] = defaultdict(list)
