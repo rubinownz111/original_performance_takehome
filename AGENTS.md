@@ -26,6 +26,11 @@
 - Note: the currently checked-out worktree on `2026-03-05` re-validates at this `1065` baseline. Older `1078-1082` entries below are useful historical context from earlier architecture exploration, but they do not describe the present file state.
 
 ## Findings So Far
+- A narrow overflow-to-root stage-5 fusion path is now the strongest architectural lead from this session:
+- `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` skips the stage-5 const only on round `10` (overflow), then repairs it in round `11`'s root XOR with no branch/index bias tracking.
+- It is correctness-valid and reduces real slot pressure to `valu=5982` and `alu=12099` (`12345 ops`), but still measures `1067` cycles.
+- Combining it with in-place scalar scatter-to-values removes even more graph scaffolding (`12101 ops`, `alu=12083`, `valu=5984`) but still remains at `1067`.
+- Implication: this targeted fusion is directionally right, but it still needs a second architectural change that converts the better slot profile into actual overlap/cycle improvement.
 - Deep scatter result storage can now be rewritten in place without breaking correctness:
 - A new lane-precise partial-vector writer model allows scalar scatter XORs to write directly back into the live `values` vector.
 - This removes `244` emitted ops from the `1065` kernel (`12375 -> 12131`) with correctness preserved, but cycle count and slot totals stay unchanged (`1065`, `load=2001`, `valu=6010`, `alu=12122`).
@@ -83,6 +88,37 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-05: Specialized overflow-to-root stage-5 fusion.
+- What changed/tested:
+- Added `ENABLE_WRAP_ROOT_STAGE5_FUSION`, which skips stage-5 const only on the overflow round (`depth == forest_height`) and absorbs that const into the next round's root XOR using `tree_root_vec_xor5`, without enabling the full generic fusion/bias framework.
+- Also tested two targeted companion combinations:
+- with `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True`
+- with the known cycle-tied gate map `ROUND_GATE_WINDOW_BY_ROUND={7:28,9:26,10:28}`
+- Why: the generic fusion framework is too heavy, but the round-10 -> round-11 transition is special because the index always resets to the root, so this fuse can be done without branch-bit bias bookkeeping.
+- Result:
+- `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` -> `1067` cycles, pass, `12345` ops, `valu=5982`, `alu=12099`.
+- `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` + `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True` -> `1067` cycles, pass, `12101` ops, `valu=5984`, `alu=12083`.
+- `ENABLE_WRAP_ROOT_STAGE5_FUSION=True` + `ROUND_GATE_WINDOW_BY_ROUND={7:28,9:26,10:28}` -> `1067` cycles, pass, `12343` ops, `valu=5982`, `alu=12097`.
+- Decision: keep the new specialized fusion path as disabled scaffolding for now. It is the best new direction from this session, but it does not yet beat the `1065` baseline.
+
+- 2026-03-05: Scheduler load-aware ordering narrowed to load-vs-load only.
+- What changed/tested: refined the previous scheduler rewrite so global heap order stayed intact and only ready load ops were reordered against other ready load ops based on immediate unlock potential.
+- Why: salvage the good part of the prior idea (better use of the two load slots) without globally biasing the whole schedule toward loads.
+- Result: correctness pass but still `1075` cycles, matching the fully global rewrite. Peak scratch again dropped to `1481/1536`, but cycle time did not recover.
+- Decision: reverted the scheduler queue rewrite entirely and restored the baseline scheduler. Load-aware selection in this form is not the missing piece.
+
+- 2026-03-05: Scheduler ready-queue rewrite with global load-unlock preference.
+- What changed/tested: changed the scheduler to scan the ready queue each cycle and globally prefer ready load ops that immediately unlock successor chains, instead of consuming the heap strictly in static-priority order.
+- Why: load slots are still the dominant defer source, so the goal was to make the two load slots spend more time on dependency-critical deep scatter work.
+- Result: correctness pass but regression to `1075` cycles. Peak scratch dropped materially to `1481/1536`, but the global load bias hurt overall overlap enough to lose `10` cycles.
+- Decision: reject the global version. Any load-aware heuristic needs to stay local to load-vs-load choice rather than overriding cross-engine ordering.
+
+- 2026-03-05: Lazy depth-4 setup on first use.
+- What changed/tested: added `DELAY_DEPTH_4_SETUP` and a deferred `_emit_depth4_setup()` path so the main depth-4 broadcast/diff bundle can be emitted only when the first depth-4 vselect round reaches it.
+- Why: stop paying the large depth-4 setup liveness cost from cycle 0; this was the next scratch/lifetime rewrite after the in-place deep-path work.
+- Result: correctness pass but regression to `1075` cycles, with slot totals shifting to `load=2001`, `valu=6022`, `alu=12026`, `flow=785`.
+- Decision: keep disabled. Moving depth-4 setup onto the first round-4 critical path is worse than carrying it live from the start.
+
 - 2026-03-05: Scatter-vector combine writes directly into `values`.
 - What changed/tested: added `SCATTER_VECTOR_XOR_WRITE_TO_VALUES` so the depth-5 vector-scatter path can load into a temporary scatter buffer but write the final vector XOR result back into the live `values` vector instead of a fresh result vector or the scatter buffer. Tested `SCATTER_VECTOR_XOR=True`, `SCATTER_VECTOR_XOR_WRITE_TO_VALUES=True`, `SCATTER_VECTOR_XOR_DEPTHS={5}`.
 - Why: check whether the prior `1071` regression from vector scatter combine was caused by result-buffer placement/liveness rather than by the ALU->VALU engine trade itself.
