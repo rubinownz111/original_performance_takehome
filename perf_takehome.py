@@ -85,6 +85,19 @@ DEPTH_5_VSELECT_GROUPS: set[int] = set()
 # Number of even/odd depth-5 pairs to lower via multiply_add leaves.
 # 0 means all depth-5 leaves are flow/vselect.
 DEPTH_5_VSELECT_DIFF_PAIRS: int = 0
+# Delay depth-5 setup until the first depth-5 round reaches it, reducing
+# long-lived scratch pressure from one-round-only setup vectors.
+DELAY_DEPTH_5_SETUP: bool = False
+# Duplicate depth-3/depth-4 setup for the late shallow rounds (14/15) so the
+# early copy can die after round 4 instead of staying live across deep rounds.
+DELAY_LATE_D3D4_SETUP: bool = False
+# Reuse hash-stage temp vectors for the final combine result instead of
+# allocating a fresh output vector. This is a local temp-reuse path, not a
+# full in-place overwrite of the input values buffer.
+REUSE_HASH_COMBINE_TEMPS: bool = False
+# Optional stage filter for hash temp reuse. Empty means "all eligible stages"
+# when REUSE_HASH_COMBINE_TEMPS is enabled.
+REUSE_HASH_COMBINE_TEMP_STAGES: set[int] = set()
 
 # When True, reverse bit order in vselect tree: use earliest bit (bit0)
 # for leaf multiply_add, allowing tree computation to start before later
@@ -133,6 +146,12 @@ ENABLE_INPLACE_VECTOR_DATAFLOW: bool = False
 # Experimental selective in-place controls; either can be enabled independently.
 ENABLE_INPLACE_TREE_XOR_DATAFLOW: bool = False
 ENABLE_INPLACE_HASH_DATAFLOW: bool = False
+# Narrower hash in-place path: only stage-0 and stage-4 `multiply_add` ops
+# overwrite the live values vector, leaving the temp-heavy combine stages in SSA.
+ENABLE_INPLACE_HASH_MULADD_ONLY: bool = False
+# Write deep scalar scatter results directly back into the live `values`
+# vector lane-by-lane instead of allocating a separate output vector.
+ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES: bool = False
 # Reuse child vector buffers during vselect tree reductions.
 ENABLE_INPLACE_VSELECT_REDUCTION: bool = True
 BASELINE_CYCLES: int = 147734
@@ -164,6 +183,12 @@ PREFER_FLOW_CONST: bool = False
 # Experimental: in scatter path, load all 8 node values into a vector and
 # combine with one vector XOR instead of 8 scalar ALU XORs.
 SCATTER_VECTOR_XOR: bool = False
+# When True, the scatter-vector combine overwrites the loaded scatter buffer
+# instead of allocating a fresh output vector.
+SCATTER_VECTOR_XOR_INPLACE: bool = False
+# When True, the scatter-vector combine overwrites the live `values` vector
+# instead of materializing a separate result vector.
+SCATTER_VECTOR_XOR_WRITE_TO_VALUES: bool = False
 # Optional filters for SCATTER_VECTOR_XOR. Empty means "all".
 SCATTER_VECTOR_XOR_DEPTHS: set[int] = set()
 SCATTER_VECTOR_XOR_GROUPS: set[int] = set()
@@ -861,6 +886,10 @@ class Scheduler:
         """Check if a VALU op can be decomposed into scalar ALU ops."""
         if op.engine != "valu":
             return False
+        if "_scat_xor_vec_inplace" in op.id:
+            return False
+        if "_scat_xor_vec_to_values" in op.id:
+            return False
         if DISABLE_OFFLOAD_SCATTER_VEC_XOR and "_scat_xor_vec" in op.id:
             return False
         match op.slot:
@@ -902,6 +931,14 @@ class Scheduler:
         alloc = self.allocator
         V = self.V
 
+        # Retroactive past-cycle offload can only allocate a fresh physical
+        # block. Full-vector write_to ops already have a fixed destination
+        # block, so reject them here before touching the free list.
+        if op.write_size == 0 or op.vbase < 0:
+            return False
+        if op.vbase in alloc.vmap:
+            return False
+
         rejected: list[int] = []
         found = -1
         while alloc.vector_free:
@@ -929,10 +966,6 @@ class Scheduler:
             alloc.peak_vector = min(alloc.peak_vector, fresh)
             found = fresh
 
-        if op.write_size == 0 or op.vbase < 0:
-            return False
-        if op.vbase in alloc.vmap:
-            return False
         alloc.vid_ownership[op.id] = (found, op.write_size)
         alloc.vbase_owner[op.vbase] = op.id
         alloc.owner_vbase[op.id] = op.vbase
@@ -1246,6 +1279,7 @@ class SetupRefs:
     """Typed container for all one-time setup references."""
     const_zero: Ref
     group_offset: dict[int, Ref]
+    forest_values_ptr: Ref
     inp_values_ptr: Ref
     tree_root_vec: Ref
     tree_root_vec_xor5: Ref | None
@@ -1260,10 +1294,14 @@ class SetupRefs:
     tree_d3_diff: dict[int, Ref]
     tree_d3_vec_xor5_inv: dict[int, Ref]
     tree_d3_diff_xor5_inv: dict[int, Ref]
+    tree_d3_vec_late: dict[int, Ref]
+    tree_d3_diff_late: dict[int, Ref]
     tree_d4_vec: dict[int, Ref]
     tree_d4_diff: dict[int, Ref]
     tree_d4_vec_xor5_inv: dict[int, Ref]
     tree_d4_diff_xor5_inv: dict[int, Ref]
+    tree_d4_vec_late: dict[int, Ref]
+    tree_d4_diff_late: dict[int, Ref]
     tree_d5_vec: dict[int, Ref]
     tree_d5_diff: dict[int, Ref]
     tree_mirror_base_vec: dict[int, Ref]
@@ -1300,7 +1338,7 @@ class KernelBuilder:
         self.virt_ptr: int = VIRTUAL_BASE
         self.vid_to_vaddr: dict[str, int] = {}
         self.vid_size: dict[str, int] = {}
-        self.block_writers: dict[str, list[str]] = {}
+        self.block_writers: dict[str, list[list[str]]] = {}
         self._const_cache: dict[int, Ref] = {}
         self._const_vec_cache: dict[int, Ref] = {}
 
@@ -1354,7 +1392,7 @@ class KernelBuilder:
         self.virt_ptr += VLEN
         self.vid_to_vaddr[name] = vaddr
         self.vid_size[name] = VLEN
-        self.block_writers[name] = []
+        self.block_writers[name] = [[] for _ in range(VLEN)]
         self.ops.append(Op(name, AllocSlot(VLEN),
                            deps=self._resolve_deps(deps),
                            write_size=VLEN, vbase=vaddr))
@@ -1405,7 +1443,11 @@ class KernelBuilder:
                 resolved.append(self.vid_to_vaddr[arg.vid] + arg.offset)
                 auto_deps.append(arg.vid)
                 if arg.vid in self.block_writers:
-                    auto_deps.extend(self.block_writers[arg.vid])
+                    if self.vid_size.get(arg.vid) == VLEN and arg.offset != 0:
+                        auto_deps.extend(self.block_writers[arg.vid][arg.offset])
+                    else:
+                        for lane_writers in self.block_writers[arg.vid]:
+                            auto_deps.extend(lane_writers)
             else:
                 resolved.append(arg)
 
@@ -1422,7 +1464,9 @@ class KernelBuilder:
             self.vid_to_vaddr[vid] = dest_vaddr
             self.vid_size[vid] = write_size
             if write_size == 1:
-                self.block_writers[write_to.vid].append(vid)
+                if write_to.vid not in self.block_writers:
+                    self.block_writers[write_to.vid] = [[] for _ in range(VLEN)]
+                self.block_writers[write_to.vid][write_to.offset].append(vid)
                 auto_deps.append(write_to.vid)
         else:
             write_size = produced_size
@@ -1431,6 +1475,8 @@ class KernelBuilder:
                 self.virt_ptr += write_size
                 self.vid_to_vaddr[vid] = dest_vaddr
                 self.vid_size[vid] = write_size
+                if write_size == VLEN:
+                    self.block_writers[vid] = [[] for _ in range(VLEN)]
             else:
                 dest_vaddr = None
 
@@ -1509,6 +1555,7 @@ class KernelBuilder:
         n_diff_pairs: int | None = None,
         xor_const: Ref | None = None,
         emit_odd_for_diff_pairs: bool = False,
+        deps: list[Ref] | None = None,
     ) -> tuple[dict[int, Ref], dict[int, Ref]]:
         """Broadcast values and compute pairwise diffs as needed.
 
@@ -1529,29 +1576,130 @@ class KernelBuilder:
             if xor_const is not None:
                 base_ref = self.emit(
                     f"{label}_xbase_{2 * i}", "alu",
-                    ("^", base_ref, xor_const))
+                    ("^", base_ref, xor_const),
+                    deps=deps)
                 other_ref = self.emit(
                     f"{label}_xother_{2 * i + 1}", "alu",
-                    ("^", other_ref, xor_const))
+                    ("^", other_ref, xor_const),
+                    deps=deps)
             vec[2 * i] = self.emit(
                 f"{label}_vec_{2 * i}", "valu",
-                ("vbroadcast", base_ref))
+                ("vbroadcast", base_ref),
+                deps=deps)
             if i < n_diff_pairs:
                 scalar_diff = self.emit(
                     f"{label}_sdiff_{i}", "alu",
-                    ("-", other_ref, base_ref))
+                    ("-", other_ref, base_ref),
+                    deps=deps)
                 diff[i] = self.emit(
                     f"{label}_diff_{i}", "valu",
-                    ("vbroadcast", scalar_diff))
+                    ("vbroadcast", scalar_diff),
+                    deps=deps)
                 if emit_odd_for_diff_pairs:
                     vec[2 * i + 1] = self.emit(
                         f"{label}_vec_{2 * i + 1}", "valu",
-                        ("vbroadcast", other_ref))
+                        ("vbroadcast", other_ref),
+                        deps=deps)
             else:
                 vec[2 * i + 1] = self.emit(
                     f"{label}_vec_{2 * i + 1}", "valu",
-                    ("vbroadcast", other_ref))
+                    ("vbroadcast", other_ref),
+                    deps=deps)
         return vec, diff
+
+    def _emit_depth5_setup(
+        self,
+        forest_values_ptr: Ref,
+        deps: list[Ref] | None = None,
+    ) -> tuple[dict[int, Ref], dict[int, Ref]]:
+        """Emit depth-5 vselect setup, optionally delayed behind deps."""
+        d5_base_addr = self.emit(
+            "tree_d5_base_addr", "alu",
+            ("+", forest_values_ptr, self.get_const(31)),
+            deps=deps)
+        d5_sources: list[tuple[Ref, int]] = []
+        for block in range(4):
+            if block == 0:
+                block_addr = d5_base_addr
+            else:
+                block_addr = self.emit(
+                    f"tree_d5_blk_addr_{block}", "alu",
+                    ("+", d5_base_addr, self.get_const(8 * block)),
+                    deps=deps)
+            block_vec = self.emit(
+                f"tree_d5_blk_{block}", "load", ("vload", block_addr),
+                deps=deps)
+            for i in range(8):
+                d5_sources.append((block_vec, i))
+
+        if REVERSE_TREE_BIT_ORDER_DEPTH_5:
+            d5_sources = _bit_reverse_permute(d5_sources, 5)
+
+        n_pairs = len(d5_sources) // 2
+        n_diff_pairs = max(0, min(DEPTH_5_VSELECT_DIFF_PAIRS, n_pairs))
+        return self._emit_broadcast_and_diff(
+            "tree_d5", d5_sources, n_diff_pairs=n_diff_pairs, deps=deps)
+
+    def _emit_late_d3d4_setup(
+        self,
+        forest_values_ptr: Ref,
+        deps: list[Ref] | None = None,
+    ) -> tuple[dict[int, Ref], dict[int, Ref], dict[int, Ref], dict[int, Ref]]:
+        """Emit duplicate d3/d4 setup for the late shallow rounds."""
+        late_tree_vals_lo = self.emit(
+            "late_tree_vals_lo", "load", ("vload", forest_values_ptr), deps=deps)
+        late_tree_vals_hi_addr = self.emit(
+            "late_tree_vals_hi_addr", "alu",
+            ("+", forest_values_ptr, self.get_const(8)),
+            deps=deps)
+        late_tree_vals_hi = self.emit(
+            "late_tree_vals_hi", "load",
+            ("vload", late_tree_vals_hi_addr), deps=deps)
+
+        d3_sources = (
+            [(late_tree_vals_lo, 7)]
+            + [(late_tree_vals_hi, i) for i in range(7)])
+        if REVERSE_TREE_BIT_ORDER_DEPTH_3:
+            d3_sources = _bit_reverse_permute(d3_sources, 3)
+        d3_n_pairs = len(d3_sources) // 2
+        d3_n_diff_pairs = max(
+            0, min(self._max_depth_diff_pairs(3), d3_n_pairs))
+        tree_d3_vec_late, tree_d3_diff_late = self._emit_broadcast_and_diff(
+            "late_tree_d3", d3_sources,
+            n_diff_pairs=d3_n_diff_pairs,
+            emit_odd_for_diff_pairs=bool(DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND),
+            deps=deps)
+
+        d4_lo_addr = self.emit(
+            "late_tree_d4_lo_addr", "alu",
+            ("+", forest_values_ptr, self.get_const(15)),
+            deps=deps)
+        d4_lo = self.emit(
+            "late_tree_d4_lo", "load", ("vload", d4_lo_addr), deps=deps)
+        d4_hi_addr = self.emit(
+            "late_tree_d4_hi_addr", "alu",
+            ("+", forest_values_ptr, self.get_const(23)),
+            deps=deps)
+        d4_hi = self.emit(
+            "late_tree_d4_hi", "load", ("vload", d4_hi_addr), deps=deps)
+        d4_sources = (
+            [(d4_lo, i) for i in range(8)]
+            + [(d4_hi, i) for i in range(8)])
+        if REVERSE_TREE_BIT_ORDER_DEPTH_4:
+            d4_sources = _bit_reverse_permute(d4_sources, 4)
+        d4_n_pairs = len(d4_sources) // 2
+        d4_n_diff_pairs = max(
+            0, min(self._max_depth_diff_pairs(4), d4_n_pairs))
+        tree_d4_vec_late, tree_d4_diff_late = self._emit_broadcast_and_diff(
+            "late_tree_d4", d4_sources,
+            n_diff_pairs=d4_n_diff_pairs,
+            emit_odd_for_diff_pairs=bool(DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND),
+            deps=deps)
+
+        return (
+            tree_d3_vec_late, tree_d3_diff_late,
+            tree_d4_vec_late, tree_d4_diff_late,
+        )
 
     def _emit_setup(self, num_groups: int, forest_height: int) -> SetupRefs:
         """Emit all one-time setup ops. Returns typed SetupRefs."""
@@ -1625,6 +1773,8 @@ class KernelBuilder:
         tree_d3_diff: dict[int, Ref] = {}
         tree_d3_vec_xor5_inv: dict[int, Ref] = {}
         tree_d3_diff_xor5_inv: dict[int, Ref] = {}
+        tree_d3_vec_late: dict[int, Ref] = {}
+        tree_d3_diff_late: dict[int, Ref] = {}
         if ENABLE_DEPTH_3_VSELECT:
             d3_sources = (
                 [(tree_vals_lo, 7)]
@@ -1643,6 +1793,8 @@ class KernelBuilder:
         tree_d4_diff: dict[int, Ref] = {}
         tree_d4_vec_xor5_inv: dict[int, Ref] = {}
         tree_d4_diff_xor5_inv: dict[int, Ref] = {}
+        tree_d4_vec_late: dict[int, Ref] = {}
+        tree_d4_diff_late: dict[int, Ref] = {}
         if ENABLE_DEPTH_4_VSELECT:
             d4_lo_addr = self.emit(
                 "tree_d4_lo_addr", "alu", ("+", fvp, self.get_const(15)))
@@ -1737,29 +1889,8 @@ class KernelBuilder:
 
         tree_d5_vec: dict[int, Ref] = {}
         tree_d5_diff: dict[int, Ref] = {}
-        if DEPTH_5_VSELECT_GROUPS:
-            d5_base_addr = self.emit(
-                "tree_d5_base_addr", "alu", ("+", fvp, self.get_const(31)))
-            d5_sources: list[tuple[Ref, int]] = []
-            for block in range(4):
-                if block == 0:
-                    block_addr = d5_base_addr
-                else:
-                    block_addr = self.emit(
-                        f"tree_d5_blk_addr_{block}", "alu",
-                        ("+", d5_base_addr, self.get_const(8 * block)))
-                block_vec = self.emit(
-                    f"tree_d5_blk_{block}", "load", ("vload", block_addr))
-                for i in range(8):
-                    d5_sources.append((block_vec, i))
-
-            if REVERSE_TREE_BIT_ORDER_DEPTH_5:
-                d5_sources = _bit_reverse_permute(d5_sources, 5)
-
-            n_pairs = len(d5_sources) // 2
-            n_diff_pairs = max(0, min(DEPTH_5_VSELECT_DIFF_PAIRS, n_pairs))
-            tree_d5_vec, tree_d5_diff = self._emit_broadcast_and_diff(
-                "tree_d5", d5_sources, n_diff_pairs=n_diff_pairs)
+        if DEPTH_5_VSELECT_GROUPS and not DELAY_DEPTH_5_SETUP:
+            tree_d5_vec, tree_d5_diff = self._emit_depth5_setup(fvp)
 
         hash_const1_vec: dict[int, Ref] = {}
         for stage in (0, 1, 4, 5):
@@ -1800,6 +1931,7 @@ class KernelBuilder:
 
         return SetupRefs(
             const_zero=const_zero, group_offset=group_offset,
+            forest_values_ptr=fvp,
             inp_values_ptr=ivp,
             tree_root_vec=tree_root_vec,
             tree_root_vec_xor5=tree_root_vec_xor5,
@@ -1813,9 +1945,13 @@ class KernelBuilder:
             tree_d3_vec=tree_d3_vec, tree_d3_diff=tree_d3_diff,
             tree_d3_vec_xor5_inv=tree_d3_vec_xor5_inv,
             tree_d3_diff_xor5_inv=tree_d3_diff_xor5_inv,
+            tree_d3_vec_late=tree_d3_vec_late,
+            tree_d3_diff_late=tree_d3_diff_late,
             tree_d4_vec=tree_d4_vec, tree_d4_diff=tree_d4_diff,
             tree_d4_vec_xor5_inv=tree_d4_vec_xor5_inv,
             tree_d4_diff_xor5_inv=tree_d4_diff_xor5_inv,
+            tree_d4_vec_late=tree_d4_vec_late,
+            tree_d4_diff_late=tree_d4_diff_late,
             tree_d5_vec=tree_d5_vec, tree_d5_diff=tree_d5_diff,
             tree_mirror_base_vec=tree_mirror_base_vec,
             hash_const1_vec=hash_const1_vec,
@@ -1993,8 +2129,19 @@ class KernelBuilder:
                 biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias
                 and s.tree_d3_diff_xor5_inv and s.tree_d3_vec_xor5_inv
             )
-            d3_diff = s.tree_d3_diff_xor5_inv if use_fast_bias else s.tree_d3_diff
-            d3_vec = s.tree_d3_vec_xor5_inv if use_fast_bias else s.tree_d3_vec
+            use_late_d3 = (
+                not ENABLE_STAGE5_TREE_FUSION
+                and rnd > 10
+                and bool(s.tree_d3_vec_late)
+            )
+            d3_diff = (
+                s.tree_d3_diff_xor5_inv if use_fast_bias
+                else (s.tree_d3_diff_late if use_late_d3 else s.tree_d3_diff)
+            )
+            d3_vec = (
+                s.tree_d3_vec_xor5_inv if use_fast_bias
+                else (s.tree_d3_vec_late if use_late_d3 else s.tree_d3_vec)
+            )
             b0 = bit0 if use_fast_bias else unbiased_bit(bit0, 0)
             b1 = bit1 if use_fast_bias else unbiased_bit(bit1, 1)
             b2 = bit2 if use_fast_bias else unbiased_bit(bit2, 2)
@@ -2025,8 +2172,19 @@ class KernelBuilder:
                 biased_prev and ENABLE_STAGE5_TREE_FUSION and full_bias
                 and s.tree_d4_diff_xor5_inv and s.tree_d4_vec_xor5_inv
             )
-            d4_diff = s.tree_d4_diff_xor5_inv if use_fast_bias else s.tree_d4_diff
-            d4_vec = s.tree_d4_vec_xor5_inv if use_fast_bias else s.tree_d4_vec
+            use_late_d4 = (
+                not ENABLE_STAGE5_TREE_FUSION
+                and rnd > 10
+                and bool(s.tree_d4_vec_late)
+            )
+            d4_diff = (
+                s.tree_d4_diff_xor5_inv if use_fast_bias
+                else (s.tree_d4_diff_late if use_late_d4 else s.tree_d4_diff)
+            )
+            d4_vec = (
+                s.tree_d4_vec_xor5_inv if use_fast_bias
+                else (s.tree_d4_vec_late if use_late_d4 else s.tree_d4_vec)
+            )
             b0 = bit0 if use_fast_bias else unbiased_bit(bit0, 0)
             b1 = bit1 if use_fast_bias else unbiased_bit(bit1, 1)
             b2 = bit2 if use_fast_bias else unbiased_bit(bit2, 2)
@@ -2078,7 +2236,6 @@ class KernelBuilder:
         scatter_deps = [ts.index, values]
         if first_deps:
             scatter_deps.extend(first_deps)
-        scatter = self.alloc_vec(f"{prefix}_scatter", deps=scatter_deps)
         corrected_index = ts.index
         addr_deps = first_deps
         if ENABLE_STAGE5_TREE_FUSION and depth > 0:
@@ -2104,21 +2261,54 @@ class KernelBuilder:
         else:
             use_vec_scatter = False
 
+        scatter: Ref | None = None
+        if not ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES or use_vec_scatter:
+            scatter = self.alloc_vec(f"{prefix}_scatter", deps=scatter_deps)
+
         if use_vec_scatter:
+            assert scatter is not None
             for elem in range(V):
                 self.emit(
                     f"{prefix}_scat_load_{elem}", "load",
                     ("load", addr.with_offset(elem)),
                     write_to=scatter.with_offset(elem))
-            scatter_out = self.emit(
-                f"{prefix}_scat_xor_vec", "valu",
-                ("^", values, scatter))
+            if SCATTER_VECTOR_XOR_WRITE_TO_VALUES:
+                scatter_out = self.emit(
+                    f"{prefix}_scat_xor_vec_to_values",
+                    "valu",
+                    ("^", values, scatter),
+                    write_to=values)
+            else:
+                scatter_out = self.emit(
+                    (
+                        f"{prefix}_scat_xor_vec_inplace"
+                        if SCATTER_VECTOR_XOR_INPLACE
+                        else f"{prefix}_scat_xor_vec"
+                    ),
+                    "valu",
+                    ("^", values, scatter),
+                    write_to=(scatter if SCATTER_VECTOR_XOR_INPLACE else None))
             if biased_prev and ENABLE_STAGE5_TREE_FUSION:
                 return self.emit(
                     f"{prefix}_scat_bias_fix", "valu",
                     ("^", scatter_out, s.hash_const1_vec[5]))
             return scatter_out
 
+        if ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES:
+            if biased_prev and ENABLE_STAGE5_TREE_FUSION:
+                raise ValueError(
+                    "ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES is not supported with stage-5 fusion")
+            for elem in range(V):
+                loaded = self.emit(
+                    f"{prefix}_scat_load_{elem}", "load",
+                    ("load", addr.with_offset(elem)))
+                self.emit(
+                    f"{prefix}_scat_xor_{elem}", "alu",
+                    ("^", values.with_offset(elem), loaded),
+                    write_to=values.with_offset(elem))
+            return values
+
+        assert scatter is not None
         for elem in range(V):
             loaded = self.emit(
                 f"{prefix}_scat_load_{elem}", "load",
@@ -2142,6 +2332,14 @@ class KernelBuilder:
     ) -> Ref:
         """Emit the 6-stage hash. Returns updated values Ref."""
         use_inplace = ENABLE_INPLACE_VECTOR_DATAFLOW or ENABLE_INPLACE_HASH_DATAFLOW
+        def reuse_stage(stage_idx: int) -> bool:
+            return (
+                REUSE_HASH_COMBINE_TEMPS
+                and (
+                    not REUSE_HASH_COMBINE_TEMP_STAGES
+                    or stage_idx in REUSE_HASH_COMBINE_TEMP_STAGES
+                )
+            )
         for stage in range(6):
             op1, _v1, op2, op3, _v3 = HASH_STAGES[stage]
             if stage == 2:
@@ -2156,7 +2354,12 @@ class KernelBuilder:
                     f"{prefix}_hash23_b", "valu",
                     ("multiply_add", values,
                      s.fused_23_mult_hb, s.fused_23_const_hb))
-                if use_inplace:
+                if reuse_stage(stage):
+                    values = self.emit(
+                        f"{prefix}_hash23_combine", "valu",
+                        ("^", ha, hb),
+                        write_to=ha)
+                elif use_inplace:
                     values = self.emit(
                         f"{prefix}_hash23_combine", "valu",
                         ("^", ha, hb),
@@ -2168,7 +2371,7 @@ class KernelBuilder:
             elif stage == 3:
                 continue  # handled in stage 2
             elif stage in (0, 4):
-                if use_inplace:
+                if use_inplace or ENABLE_INPLACE_HASH_MULADD_ONLY:
                     values = self.emit(
                         f"{prefix}_hash{stage}", "valu",
                         ("multiply_add", values,
@@ -2186,7 +2389,12 @@ class KernelBuilder:
                     f"{prefix}_hash{stage}_b", "valu",
                     (op3, values, s.hash_const3_vec[stage]))
                 if stage == 5 and not include_stage5_const:
-                    if use_inplace:
+                    if reuse_stage(stage):
+                        values = self.emit(
+                            f"{prefix}_hash{stage}_combine", "valu",
+                            (op2, values, hb),
+                            write_to=hb)
+                    elif use_inplace:
                         values = self.emit(
                             f"{prefix}_hash{stage}_combine", "valu",
                             (op2, values, hb),
@@ -2199,7 +2407,12 @@ class KernelBuilder:
                 ha = self.emit(
                     f"{prefix}_hash{stage}_a", "valu",
                     (op1, values, s.hash_const1_vec[stage]))
-                if use_inplace:
+                if reuse_stage(stage):
+                    values = self.emit(
+                        f"{prefix}_hash{stage}_combine", "valu",
+                        (op2, ha, hb),
+                        write_to=ha)
+                elif use_inplace:
                     values = self.emit(
                         f"{prefix}_hash{stage}_combine", "valu",
                         (op2, ha, hb),
@@ -2339,6 +2552,8 @@ class KernelBuilder:
         completed_stores: list[Ref] = []
         deep_round_tokens: dict[int, list[Ref]] = defaultdict(list)
         round_tokens: dict[int, list[Ref]] = defaultdict(list)
+        depth5_setup_emitted = bool(s.tree_d5_vec)
+        late_d3d4_setup_emitted = not DELAY_LATE_D3D4_SETUP
 
         group_order = list(range(num_groups))
         if GROUP_EMIT_ORDER_MODE != "identity":
@@ -2428,6 +2643,36 @@ class KernelBuilder:
                     round_start_deps.append(
                         deep_round_tokens[rnd][logical_g - deep_window]
                     )
+
+                if (DELAY_LATE_D3D4_SETUP
+                        and not late_d3d4_setup_emitted
+                        and rnd >= 14
+                        and depth in (3, 4)):
+                    if ENABLE_STAGE5_TREE_FUSION:
+                        raise ValueError(
+                            "DELAY_LATE_D3D4_SETUP is not supported with stage-5 fusion")
+                    late_setup_deps = [values]
+                    if round_start_deps:
+                        late_setup_deps.extend(round_start_deps)
+                    (
+                        s.tree_d3_vec_late,
+                        s.tree_d3_diff_late,
+                        s.tree_d4_vec_late,
+                        s.tree_d4_diff_late,
+                    ) = self._emit_late_d3d4_setup(
+                        s.forest_values_ptr, deps=late_setup_deps)
+                    late_d3d4_setup_emitted = True
+
+                if (DELAY_DEPTH_5_SETUP
+                        and not depth5_setup_emitted
+                        and depth == 5
+                        and use_vselect_at_depth_5(logical_g)):
+                    d5_setup_deps = [values]
+                    if round_start_deps:
+                        d5_setup_deps.extend(round_start_deps)
+                    s.tree_d5_vec, s.tree_d5_diff = self._emit_depth5_setup(
+                        s.forest_values_ptr, deps=d5_setup_deps)
+                    depth5_setup_emitted = True
 
                 tree_values = self._emit_tree_xor(
                     prefix, depth, logical_g, rnd, values, ts, s,
