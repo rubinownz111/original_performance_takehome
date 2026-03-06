@@ -26,6 +26,121 @@
 - Note: the currently checked-out worktree on `2026-03-06` re-validates at this `1063` baseline. Older `1064-1082` entries below are useful historical context from earlier architecture exploration, but they do not describe the present file state.
 
 ## Findings So Far
+- Deep-only early stage-5 preconst branching is not competitive:
+- using the algebraic identity `branch(final) = branch(a ^ (a >> 16)) xor 1` to start branch/index updates from the stage-5 pre-const value on selected deep rounds is correctness-valid only for the later deep depths, and all valid points still regress.
+- Best correctness-valid points on the checked-in winner:
+- `EARLY_STAGE5_PRECONST_BRANCH_DEPTHS={8}` -> `1071`, `11958 ops`, `load=1991`, `flow=798`, `alu=11988`, `valu=6062`, peak scratch `1489/1536`.
+- `EARLY_STAGE5_PRECONST_BRANCH_DEPTHS={9}` -> `1071`, `11925 ops`, `alu=12092`, `valu=6016`, peak scratch `1457/1536`.
+- `EARLY_STAGE5_PRECONST_BRANCH_DEPTHS={7}` -> `1077`, `alu=12108`, `valu=6080`.
+- `EARLY_STAGE5_PRECONST_BRANCH_DEPTHS={10}` is a trivial `1063` tie because the overflow round has no next-round branch/index update to shorten.
+- Earlier / broader variants are worse or incorrect:
+- `{6}` -> `1090`, `{6,7}` -> `1087`, `{5}` -> `1109` and fail, `{5..10}` -> `1113` and fail.
+- On the strongest `{6,7}` vector-scatter tie family, the same rewrite is also bad:
+- `{6,7}` -> `1093`, fail; `{5}` -> `1108`, fail.
+- Implication: even when limited to deep rounds where no shallow tree bits are carried, the preconst-branch path adds too much bias-fix / VALU pressure to pay for the shorter stage-5 tail. This algebraic branch-tail family is a dead end on the current branch.
+- Sparse delayed depth-5 static selection is still non-competitive even on the current `1063` families:
+- on the checked-in winner and the strongest `{6,7}` tie family, the historically best depth-5 groups (`22/27/30`) do cut real loads (`1991 -> 1987`), but the saved tree loads are overpaid by extra flow/VALU work.
+- Best correctness-valid points from the targeted re-test:
+- checked-in winner + `DEPTH_5_VSELECT_GROUPS={30}`, `DEPTH_5_VSELECT_DIFF_PAIRS=16`, `DELAY_DEPTH_5_SETUP=True` -> `1071`, `11965 ops`, `load=1987`, `flow=815`, `alu=12064`, `valu=6036`, peak scratch `1470/1536`.
+- strongest `{6,7}` tie family + `DEPTH_5_VSELECT_GROUPS={27}`, `DEPTH_5_VSELECT_DIFF_PAIRS=16`, `DELAY_DEPTH_5_SETUP=True` -> `1073`, `11773 ops`, `load=1987`, `flow=815`, `alu=12080`, `valu=6034`, peak scratch `1518/1536`.
+- Implication: this is a real tree-load cut, not another scheduling/dataflow reshuffle, and it still loses decisively. The depth-5 static-selection scaffold remains the wrong trade on the current `1063` branch.
+- Split-tail xor/shift hash rewrites are not competitive on the `1063` family:
+- rewriting hash stages `1` and/or `5` as `tmp = a ^ (a >> s)` followed by `tmp ^ const` removes the extra `ha` temp vector and lowers peak scratch materially, but every correctness-valid variant regresses.
+- Representative results on the checked-in winner:
+- stage `5` only -> `1092`, pass, `11892 ops`, `load=1991`, `flow=798`, `alu=12052`, `valu=5988`, peak scratch `1385/1536`.
+- stage `1` only -> `1082`, pass, `11892 ops`, `alu=12004`, `valu=5994`, peak scratch `1409/1536`.
+- stages `{1,5}` -> `1096`, pass, `11892 ops`, `alu=12148`, `valu=5976`, peak scratch `1409/1536`.
+- On the strongest `{6,7}` alternative tie family, stage `5` only is still bad:
+- `g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + depths {6,7}` + split-tail stage `5` -> `1088`, pass, `11700 ops`, `load=1991`, `flow=798`, `alu=11852`, `valu=6013`, peak scratch `1425/1536`.
+- Implication: the xor/shift hash tail wants the old const-first shape. Saving the temp vector lowers scratch and can lower ALU on some tied families, but it damages overlap enough to lose cycles.
+- A stronger stage-5 branch-tail version of the same rewrite is even worse:
+- feeding branch/index updates from the pre-const stage-5 value (`a ^ (a >> 16)`) adds widespread bias-fix overhead, blows the graph up to `12601` ops, and fails correctness at `1171`.
+- Implication: the existing bit/index-bias machinery is too expensive a vehicle for an “early branch from pre-const stage 5” idea on this branch.
+- Carrying deep-scatter address vectors across rounds is overlap-neutral when it preserves the existing vector-scatter dependency anchors:
+- a guarded `CARRY_SCATTER_ADDR_STATE` path that reuses the next round's precomputed `tree_base_1indexed + index` vector ties exactly on both the checked-in `1063` winner and the strongest `{6,7}` alternative tie family.
+- Representative tied points:
+- current `1063` baseline + carry path -> `1063`, pass, `11892 ops`, `load=1991`, `flow=798`, `alu=11964`, `valu=5999`, peak scratch `1465/1536`.
+- `g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + depths {6,7}` + carry path -> `1063`, pass, `11700 ops`, `load=1991`, `flow=798`, `alu=11924`, `valu=6004`, peak scratch `1498/1536`.
+- A more aggressive version of the same rewrite is actively bad:
+- when the depth-6 vector-scatter branch was allowed to anchor its alloc/load chain directly on the carried address vector instead of the original `corrected_index`/gate dependency shape, the current winner regressed to `1079` with `alu=12116`, `valu=5980`, peak scratch `1393/1536`.
+- Implication: simply making deep scatter addresses available earlier does not help on this scheduler, and the current depth-6 vector-scatter win is sensitive to its existing dependency anchors. Lower scratch / earlier addr readiness alone is not a path to `1062`.
+- Split half-vector deep scatter is a clear dead end:
+- replacing one deep scalar scatter round with two zero-filled 4-lane partial-vector combines (so each combine waits on only four loads) regresses badly despite lower emitted op counts.
+- Representative results:
+- split depth `5` on the `1063` winner -> `1071`, `11764 ops`, `alu=12284`, `valu=6055`.
+- split depth `7` -> `1095`, `alu=12324`, `valu=6050`, peak scratch `1528/1536`.
+- split depth `8` on the stronger `{6,7}` tie family -> `1087`, `11572 ops`, `alu=12228`, `valu=6062`.
+- Implication: on this scheduler, the extra zero-init vector ops and split vector XORs cost far more than the shorter 4-load critical span recovers. This dependency-shape rewrite is not competitive.
+- A direct depth-6 static-subtree selection rewrite is not competitive on this ISA in its current form:
+- the new depth-6 vselect scaffold (preload 64 depth-6 leaves once, then select with a 6-bit vselect tree) can be mathematically correct, but its best normal-scratch single-group point is still only `1149`.
+- Best correctness-valid points under the real `1536`-word scratch:
+- `DEPTH_6_VSELECT_GROUPS={3}`, `DEPTH_6_VSELECT_DIFF_PAIRS=0` -> `1149`, pass.
+- other valid sparse groups land roughly `1158-1211`.
+- Many apparently “great” low-cycle single-group points (`338-410`) are invalid under the real allocator/scratch regime, but become correctness-valid with huge scratch (`2_000_000`) at about `1090-1101`.
+- Implication: the mathematical rewrite itself is not the main blocker; the combination of huge static setup and tight scratch mapping is. Even after removing that blocker with huge scratch, the architecture is still far from the current `1063` floor, so this direct depth-6 static-selection family is a dead end.
+- New ISA constraint now confirmed from the rewrite design:
+- without a gather or lane-permute primitive, deeper static subtree selection past depth `5` necessarily expands into a large broadcast/select tree rather than a compact block-selection kernel.
+- Implication: future “static subtree” ideas need a more radical factorization than just extending the existing depth-5 vselect architecture one level deeper.
+- The new `SCATTER_VECTOR_XOR_GROUPS_BY_DEPTH` scaffold is baseline-neutral when unused:
+- after adding the depth-specific mask support, the checked-in default still passes `python3 tests/submission_tests.py` at `1063`.
+- Implication: the scaffold is safe to keep for future experiments even though the first subset/two-subset searches did not improve cycles.
+- The new depth-7 subset mechanism is now locally exhausted through pair removals:
+- a full 2-group removal sweep from the `g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + depths {6,7}` family found no point below `1063`.
+- The plateau is extremely broad:
+- `335` distinct 2-group removals still tie at `1063`.
+- Best static points seen in that pair-removal plateau:
+- `remove {0,2}` from depth-7 vector scatter -> `1063`, `11712 ops`, `load=1991`, `flow=798`, `alu=11876`, `valu=6010`, peak scratch `1505/1536`.
+- `remove {13,23}` (and several similar `23`-anchored pairs) -> `1063`, `11712 ops`, `alu=11908`, `valu=6006`, peak scratch `1498/1536`.
+- Implication: depth-7 subset tuning is a huge tie surface, not a path to `1062` on its own. The mechanism is interesting as scaffolding, but another local subset search is unlikely to pay off.
+- Depth-specific group masking makes the new depth-7 vector-scatter family much flatter than the old all-or-nothing toggle:
+- on the `g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + depths {6,7}` family, 59 different single-step depth-7 subset points still measure `1063`.
+- Best currently seen point in that plateau:
+- enable depth-7 vector scatter for all groups except `g=23` -> `1063`, `11706 ops`, `load=1991`, `flow=798`, `alu=11916`, `valu=6005`, peak scratch `1498/1536`.
+- Implication: depth `7` is not a brittle all-groups-or-none decision after all. The new useful local search surface is now “which depth-7 groups stay scalar,” not whether depth `7` is globally vectorized.
+- The new `{6,7}` vector-scatter tie family does not extend cleanly to depth `8`:
+- on the best tied foundation (`g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + depths {6,7}`), adding depth `8` drops another `192` ops and `72` ALU slots but regresses to `1065` because `valu` rises to `6013`.
+- All tested placement variants for depth `8` collapse to the same point (`plain`, `write_to_values`, and `inplace` at depth `8` all behave identically here).
+- Implication: broadening the existing vector-scatter architecture further is again blocked by VALU/overlap, not by implementation details of the destination choice. The next useful deep-scatter pass likely needs a different load-reduction mechanism than “one more whole vector-scatter depth”.
+- The strongest alternative `1063` tie-point is now a mixed shallow/setup/deep-scatter family:
+- `g=13` round-4 winner + `SPECIALIZE_INPUT_VALUES_PTR=True` + vector scatter on depths `{6,7}` is correctness-valid at `1063`.
+- Measured shape at that tied point:
+- `11700 ops`
+- `load=1991`
+- `flow=798`
+- `alu=11924`
+- `valu=6004`
+- `store=32`
+- peak scratch `1498/1536`
+- Implication: the best current follow-up foundation is no longer the checked-in baseline, but a lower-op/lower-ALU tied family that trades a little more `valu` and scratch for materially less graph/ALU overhead.
+- A new tied structural family exists beyond the narrow round-4 mask win:
+- extending the vector-scatter architecture from depth `6` to depths `{6,7}` is correctness-valid and still measures `1063`.
+- Best measured shape in that family:
+- `11700 ops`
+- `load=1991`
+- `flow=798`
+- `alu=11932`
+- `valu=6003`
+- `store=32`
+- peak scratch `1498/1536`
+- Implication: the current baseline can absorb one more deep vector-scatter round without losing cycles, and the result materially reduces emitted scaffolding / ALU versus the promoted default. This is the first structurally different `1063` family worth using as a new foundation for follow-up experiments.
+- Fresh scheduler telemetry on the current `1063` baseline still points at deep scatter/load first:
+- top defer reasons on the exact promoted default are:
+- `defer_load_full: 29919`
+- `defer_valu_full: 7853`
+- `defer_flow_full: 7109`
+- `defer_valu_full_offload_failed: 3784`
+- emitted deep scatter work remains concentrated at scalar depths `5` and `7..10`:
+- depth `5`: `256` scalar scatter loads + `256` scalar scatter XORs
+- depth `6`: `256` scatter loads + `32` vector scatter XORs (the only vectorized deep depth)
+- depths `7/8/9/10`: each `256` scalar scatter loads + `256` scalar scatter XORs
+- shallow residual scatter remains at depth `3` (`120+120`) and depth `4` (`288+288`).
+- Implication: despite the new shallow win, the next structural pass should still favor deep-scatter load reduction over more shallow tuning unless a hash-side rewrite can clearly beat a still-dominant load defer wall.
+- Round-specific diff-pair retuning is exhausted on the `1063` baseline:
+- single-axis sweeps of `DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND[3/14]` and `DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND[4/15]` all re-confirmed the current defaults.
+- Best values remain:
+- `DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND={3:4,14:3}`
+- `DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND={4:3,15:1}`
+- Implication: the `1063` win did not shift the old shallow leaf-lowering optimum. Further shallow tuning now looks exhausted enough that the next useful pass should be structural again.
 - The full round-4 swap grid confirms there is no hidden sub-`1063` swap winner:
 - among all one-for-one swaps on `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]`, the only `1063` points are the already-known equivalent singles:
 - `swap 13 -> 16`
@@ -242,6 +357,315 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-06: Reverted the deep-only preconst-branch scaffold and re-validated baseline.
+- What changed/tested:
+- Removed the temporary `EARLY_STAGE5_PRECONST_BRANCH_DEPTHS` scaffold from `perf_takehome.py`, leaving the active kernel back on the prior `1063` architecture, then re-ran `python3 tests/submission_tests.py`.
+- Why: the deep-only preconst-branch rewrite was decisively non-competitive (`1071+` when correctness-valid, several depth sets incorrect) and not worth keeping as active complexity.
+- Result:
+- `python3 tests/submission_tests.py` -> correctness pass at `1063` cycles, `11892 ops`, peak scratch `1465/1536`.
+- Decision: keep the journal entry, but keep the codebase on the simpler `1063` baseline plus the still-neutral depth-specific scatter-group scaffold.
+
+- 2026-03-06: Deep-only early stage-5 preconst branch rewrite.
+- What changed/tested:
+- Added a temporary algebraic branch-tail scaffold:
+- on selected tree depths, rewrite stage `5` as
+- `preconst = values ^ (values >> 16)`
+- `final = preconst ^ C5`
+- and feed branch/index updates from `preconst`, tracking the known parity inversion through `index_bias_mask` so later deep scatter rounds can unbias their index vectors.
+- Tested on the checked-in `1063` winner:
+- `EARLY_STAGE5_PRECONST_BRANCH_DEPTHS` in `{5}`, `{6}`, `{7}`, `{8}`, `{9}`, `{10}`, `{5,6}`, `{6,7}`, and `{5..10}`.
+- Also tested on the strongest `{6,7}` tie family:
+- `SPECIALIZE_INPUT_VALUES_PTR=True`
+- `SCATTER_VECTOR_XOR_DEPTHS={6,7}`
+- with depth sets `{5}` and `{6,7}`.
+- Why: after the split-tail hash rewrite failed, this was the narrower algebraic follow-up that still changes the hash tail for real but avoids dragging shallow bit-bias machinery into every round. Deep rounds (`>=5`) never store branch bits in `TreeState.bits`, so only index bias repair is needed.
+- Result:
+- Best correctness-valid checked-in winner points:
+- `{8}` -> `1071`, pass, `11958 ops`, `load=1991`, `flow=798`, `alu=11988`, `valu=6062`, `store=32`, peak scratch `1489/1536`.
+- `{9}` -> `1071`, pass, `11925 ops`, `load=1991`, `flow=798`, `alu=12092`, `valu=6016`, `store=32`, peak scratch `1457/1536`.
+- `{7}` -> `1077`, pass, `11992 ops`, `alu=12108`, `valu=6080`.
+- `{10}` -> trivial `1063` tie, pass, `11892 ops`, unchanged slot totals, because the overflow round has no next-round branch/index tail to shorten.
+- Worse / invalid points:
+- `{6}` -> `1090`, pass.
+- `{6,7}` -> `1087`, pass.
+- `{5}` -> `1109`, fail.
+- `{5,6}` -> `1108`, pass.
+- `{5..10}` -> `1113`, fail.
+- Strongest `{6,7}` tie family:
+- `{5}` -> `1108`, fail, `11866 ops`, `alu=12212`, `valu=6133`.
+- `{6,7}` -> `1093`, fail, `11834 ops`, `alu=12124`, `valu=6111`.
+- Decision: revert the preconst-branch scaffold. The algebraic tail-shortening idea is still decisively non-competitive on the current branch.
+
+- 2026-03-06: Targeted delayed depth-5 tree-load-cut re-test on the `1063` families.
+- What changed/tested:
+- Re-used the existing real load-cut scaffold:
+- `DEPTH_5_VSELECT_GROUPS`
+- `DEPTH_5_VSELECT_DIFF_PAIRS`
+- `DELAY_DEPTH_5_SETUP=True`
+- Tested the historically least-bad depth-5 groups (`22`, `27`, `30`) and their small subsets on:
+- the checked-in `1063` winner
+- the strongest `{6,7}` tie family (`SPECIALIZE_INPUT_VALUES_PTR=True`, `SCATTER_VECTOR_XOR_DEPTHS={6,7}`)
+- Search space:
+- subsets of `{22,27,30}` with sizes `1..3`
+- `DEPTH_5_VSELECT_DIFF_PAIRS in {8,12,16}`
+- `REVERSE_TREE_BIT_ORDER_DEPTH_5=False`
+- Why: after the failed hash-tail rewrite, this was the cleanest remaining genuine tree-load-cut path already present in the codebase. If the new `1063` families had changed the old tradeoff at all, these historically best sparse depth-5 groups were the first place it would show up.
+- Result:
+- Best checked-in winner point:
+- `DEPTH_5_VSELECT_GROUPS={30}`, `DEPTH_5_VSELECT_DIFF_PAIRS=16`, `DELAY_DEPTH_5_SETUP=True` -> `1071`, pass, `11965 ops`, `load=1987`, `flow=815`, `alu=12064`, `valu=6036`, `store=32`, peak scratch `1470/1536`.
+- Best `{6,7}` tie-family point:
+- `DEPTH_5_VSELECT_GROUPS={27}`, `DEPTH_5_VSELECT_DIFF_PAIRS=16`, `DELAY_DEPTH_5_SETUP=True` -> `1073`, pass, `11773 ops`, `load=1987`, `flow=815`, `alu=12080`, `valu=6034`, `store=32`, peak scratch `1518/1536`.
+- Other representative near-best points:
+- checked-in winner + `{30}`, diff `12` -> `1073`, `alu=12036`, `valu=6035`.
+- `{6,7}` tie family + `{30}`, diff `12` -> `1074`, `alu=12020`, `valu=6037`.
+- Multi-group subsets were materially worse (`1082-1159`).
+- Decision: keep depth-5 vselect disabled. This is a real load reduction, but it still loses badly to flow/VALU overlap on the current branch.
+
+- 2026-03-06: Reverted the split-tail hash scaffold and re-validated baseline.
+- What changed/tested:
+- Removed the temporary split-tail xor/shift hash scaffold from `perf_takehome.py`, leaving the active kernel back on the prior `1063` architecture, then re-ran `python3 tests/submission_tests.py`.
+- Why: the stage-1/stage-5 split-tail family was decisively non-competitive (`1082-1096` when correctness-valid, `1171` and incorrect for the early-branch stage-5 variant) and not worth keeping as active complexity.
+- Result:
+- `python3 tests/submission_tests.py` -> correctness pass at `1063` cycles, `11892 ops`, peak scratch `1465/1536`.
+- Decision: keep the journal entry, but keep the codebase on the simpler `1063` baseline plus the still-neutral depth-specific scatter-group scaffold.
+
+- 2026-03-06: Split-tail xor/shift hash rewrite.
+- What changed/tested:
+- Added a temporary scaffold to rewrite hash xor/shift stages as:
+- `tmp = values ^ (values >> shift)` stored back into the shift temp
+- then `tmp ^ const` for the final stage output.
+- Tested stage sets `{5}`, `{1}`, and `{1,5}` on the checked-in `1063` kernel.
+- Also tested stage `5` on the strongest `{6,7}` tie family (`SPECIALIZE_INPUT_VALUES_PTR=True`, `SCATTER_VECTOR_XOR_DEPTHS={6,7}`).
+- Finally tested a stronger stage-5-only variant that also fed branch/index updates from the pre-const value using the existing bias/unbias path.
+- Why: after the deep-scatter dead ends, this was the cleanest real hash math-graph change left: keep exact stage math, remove one temp vector from the temp-heavy xor/shift stages, and see whether the smaller scratch/live-range shape converts into cycles.
+- Result:
+- stage `5` only on the checked-in winner -> `1092`, pass, `11892 ops`, `load=1991`, `flow=798`, `alu=12052`, `valu=5988`, peak scratch `1385/1536`.
+- stage `1` only -> `1082`, pass, `11892 ops`, `alu=12004`, `valu=5994`, peak scratch `1409/1536`.
+- stages `{1,5}` -> `1096`, pass, `11892 ops`, `alu=12148`, `valu=5976`, peak scratch `1409/1536`.
+- strongest `{6,7}` tie family + stage `5` only -> `1088`, pass, `11700 ops`, `load=1991`, `flow=798`, `alu=11852`, `valu=6013`, peak scratch `1425/1536`.
+- stage `5` + pre-const branch source -> `1171`, fail, `12601 ops`, `load=1993`, `flow=802`, `alu=13420`, `valu=6520`, peak scratch `1521/1536`.
+- Decision: revert the split-tail hash scaffold. This math-graph family is decisively non-competitive on the current branch.
+
+- 2026-03-06: Reverted the carried-address scaffold and re-validated baseline.
+- What changed/tested:
+- Removed the temporary deep-scatter `CARRY_SCATTER_ADDR_STATE` scaffold from `perf_takehome.py`, leaving only the earlier depth-specific scatter-group support in place, then re-ran `python3 tests/submission_tests.py`.
+- Why: once the vector-scatter dependency anchors were restored, the carried-address rewrite was a pure `1063` tie and not worth keeping as active complexity.
+- Result:
+- `python3 tests/submission_tests.py` -> correctness pass at `1063` cycles, `11892 ops`, peak scratch `1465/1536`.
+- Decision: keep the journal entry, but keep the codebase on the simpler `1063` baseline plus the still-neutral depth-specific scatter-group scaffold.
+
+- 2026-03-06: Deep-scatter carried-address state rewrite.
+- What changed/tested:
+- Added a temporary carried-address scaffold that reuses a precomputed deep scatter address vector (`tree_base_1indexed + index`) on the following round instead of rebuilding it in `_emit_tree_xor`.
+- Tested both broad and depth-targeted variants of:
+- `CARRY_SCATTER_ADDR_STATE=True`
+- `CARRY_SCATTER_ADDR_DEPTHS` in `{all, 5, 6, 7, 8, 9, 10, 5+6, 5+6+7, 6..10}`
+- Also crossed the stabilized carry path with the strongest tied alternative family:
+- `SPECIALIZE_INPUT_VALUES_PTR=True`
+- `SCATTER_VECTOR_XOR_DEPTHS={6,7}`
+- Why: after the split-half and depth-6 static-selection failures, this was the cleanest remaining deep-scatter dependency rewrite that could shorten the pre-load chain without adding more broadcasts, zero-init vectors, or a larger static selection tree.
+- Result:
+- With the original vector-scatter dependency anchors preserved, every tested carry variant ties exactly:
+- current checked-in winner -> `1063`, pass, `11892 ops`, `load=1991`, `flow=798`, `alu=11964`, `valu=5999`, peak scratch `1465/1536`.
+- strongest `{6,7}` tie family -> `1063`, pass, `11700 ops`, `load=1991`, `flow=798`, `alu=11924`, `valu=6004`, peak scratch `1498/1536`.
+- A stronger intermediate version that made vector-scatter alloc/load depend directly on the carried address was worse:
+- broad carry or depth-6-only carry on that shape -> `1079`, pass, `11892 ops`, `alu=12116`, `valu=5980`, peak scratch `1393/1536`.
+- Decision: revert the carried-address scaffold. The rewrite is either a pure tie or, if made structurally stronger, a regression.
+
+- 2026-03-06: Reverted the split-scatter scaffold and re-validated baseline.
+- What changed/tested:
+- Removed the temporary split half-vector scatter code path from `perf_takehome.py` after logging the results, then re-ran `python3 tests/submission_tests.py`.
+- Why: the rewrite was decisively non-competitive (`1071-1095`) and not worth keeping as active complexity.
+- Result:
+- `python3 tests/submission_tests.py` -> correctness pass at `1063` cycles, `11892 ops`, peak scratch `1465/1536`.
+- Decision: keep the journal entry, but keep the codebase on the simpler `1063` baseline plus the still-neutral depth-specific scatter-group scaffold.
+
+- 2026-03-06: Split half-vector deep-scatter factorization.
+- What changed/tested:
+- Added a temporary split-scatter scaffold that replaces one deep scalar scatter round with:
+- two zero-filled partial vectors (`lanes 0..3`, then `lanes 4..7`)
+- four scalar loads into each partial vector
+- two vector XOR writebacks to `values`
+- The intent was to shorten the all-or-nothing full-vector-scatter dependency from `8` sibling loads to `4` at a time without the broadcast explosion of deeper static subtree selection.
+- Tested on the current `1063` kernel and the strongest `{6,7}` alternative tie family for depths `5`, `7`, and `8`.
+- Why: after the depth-7 subset plateau, this was the most plausible “different deep-scatter factorization” still compatible with the ISA: change dependency shape materially while keeping exact math and without building a much larger static tree.
+- Result:
+- Baseline re-check -> `1063`, pass.
+- Split depth `5` on the `1063` winner -> `1071`, pass, `11764 ops`, `load=1991`, `flow=798`, `alu=12284`, `valu=6055`, peak scratch `1496/1536`.
+- Split depth `7` on the `1063` winner -> `1095`, pass, `11764 ops`, `alu=12324`, `valu=6050`, peak scratch `1528/1536`.
+- Split depth `8` on the stronger `{6,7}` tie family -> `1087`, pass, `11572 ops`, `alu=12228`, `valu=6062`, peak scratch `1528/1536`.
+- The same regression held with and without `SPECIALIZE_INPUT_VALUES_PTR=True`.
+- Decision: revert the split-scatter scaffold. This factorization is decisively non-competitive.
+
+- 2026-03-06: Reverted the dead-end depth-6 static-selection scaffold and re-validated baseline.
+- What changed/tested:
+- Removed the temporary depth-6 static-selection code path from `perf_takehome.py` after logging the results, then re-ran `python3 tests/submission_tests.py`.
+- Why: the scaffold was a clear dead end (`1149+` when valid, many low-cycle invalid outputs under real scratch) and was not worth keeping in the active code path as extra complexity.
+- Result:
+- `python3 tests/submission_tests.py` -> correctness pass at `1063` cycles, `11892 ops`, peak scratch `1465/1536`.
+- Decision: keep the journal entry, but keep the codebase on the simpler `1063` baseline plus the still-neutral depth-specific scatter-group scaffold.
+
+- 2026-03-06: Direct depth-6 static-subtree selection rewrite.
+- What changed/tested:
+- Added a guarded depth-6 static-selection scaffold:
+- `DEPTH_6_VSELECT_GROUPS`
+- `DEPTH_6_VSELECT_DIFF_PAIRS`
+- `REVERSE_TREE_BIT_ORDER_DEPTH_6`
+- `tree_d6` setup in `SetupRefs`
+- a depth-6 `_emit_depth6_setup()` path that preloads the `64` depth-6 nodes via `8` `vload`s and lowers them through the existing broadcast/diff + vselect tree machinery
+- a depth-6 branch in `_emit_tree_xor()` plus bit-state/liveness updates so round `6` can consume `bit5`
+- Why: after the depth-7 subset plateau, the most direct “deeper static subtree selection” rewrite left on this ISA was to generalize the existing depth-5 static vselect mechanism to depth `6` and measure whether a sparse substitution could beat vector-scatter there.
+- Result:
+- Checked-in baseline with the scaffold disabled still builds/schedules at `1063`.
+- Sparse single-group sweep on the checked-in `1063` kernel with `DEPTH_6_VSELECT_DIFF_PAIRS=0`:
+- best correctness-valid normal-scratch point: `DEPTH_6_VSELECT_GROUPS={3}` -> `1149`, pass.
+- other correctness-valid points:
+- `{0}` -> `1170`
+- `{12}` -> `1160`
+- `{15}` -> `1158`
+- `{18}` -> `1166`
+- many others between `1172-1211`.
+- Strongest low-cycle but invalid points under real scratch:
+- `{30}` -> apparent `338`, fail
+- `{19}` -> apparent `388`, fail
+- `{14}` / `{16}` -> apparent `389`, fail
+- `{21}` -> apparent `410`, fail
+- `{23}` -> apparent `396`, fail
+- `all groups` -> apparent `616`, fail
+- Large-scratch diagnosis (`SCRATCH_SIZE=2_000_000`) on representative invalid sparse points:
+- `{30}` -> `1101`, pass
+- `{19}` -> `1090`, pass
+- `{14}` -> `1092`, pass
+- Decision: revert this scaffold after logging the result. It is mathematically viable but structurally non-competitive, and the normal-scratch invalidity adds noise without opening a realistic path below `1063`.
+
+- 2026-03-06: Re-validated the baseline after adding depth-specific scatter-group masking support.
+- What changed/tested:
+- No configuration changes; ran `python3 tests/submission_tests.py` with the new `SCATTER_VECTOR_XOR_GROUPS_BY_DEPTH` scaffold left at its empty default.
+- Why: confirm the new scaffolding is baseline-neutral before deciding whether to keep it in the codebase.
+- Result:
+- `python3 tests/submission_tests.py` -> correctness pass at `1063` cycles, `11892 ops`, peak scratch `1465/1536`.
+- Decision: keep the scaffold available. It does not perturb the checked-in baseline when unused.
+
+- 2026-03-06: Exhausted the new depth-7 subset mechanism through pair removals.
+- What changed/tested:
+- Starting from the strongest tied family enabled by `SCATTER_VECTOR_XOR_GROUPS_BY_DEPTH` (`g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + vector scatter on depths {6,7}`), ran:
+- an anchored 2-group removal sweep around the best single removal (`remove depth7 g23`)
+- then the full 2-group removal grid across all depth-7 groups
+- Why: the single-removal surface had 59 correctness-valid `1063` points, so the next realistic question was whether a 2-group removal could finally convert that broad plateau into a real cycle win.
+- Result:
+- No 2-group removal beat `1063`.
+- Full-grid summary:
+- `335` pair-removal points still tie at `1063`.
+- best static ALU point:
+- `remove {0,2}` -> `1063`, pass, `11712 ops`, `load=1991`, `flow=798`, `alu=11876`, `valu=6010`, peak scratch `1505/1536`.
+- best low-VALU anchored family:
+- `remove {13,23}` / `{15,23}` / `{17,23}` / `{18,23}` / `{19,23}` / `{1,23}` / `{3,23}` / `{5,23}` / `{8,23}` -> all `1063`, pass, `11712 ops`, `alu=11908`, `valu=6006`, peak scratch `1497-1498/1536`.
+- Anchored sweep also confirmed no hidden win around the best single removal:
+- many `remove {23, x}` pairs tie at `1063`, none improve.
+- Decision: keep the default unchanged and stop investing in depth-7 subset combinatorics. This new mechanism is locally exhausted as an optimization path.
+
+- 2026-03-06: Added depth-specific vector-scatter group masks and searched the first depth-7 subset neighborhood.
+- What changed/tested:
+- Added `SCATTER_VECTOR_XOR_GROUPS_BY_DEPTH` so vector scatter can be enabled for different group subsets at different depths while keeping the old global behavior unchanged when the map is empty.
+- Used it on the strongest tied family (`g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + SCATTER_VECTOR_XOR_DEPTHS={6,7}`) to search:
+- one-group removals from “all depth-7 groups”
+- one-group additions from “no depth-7 groups”
+- while depth `6` stayed vector-scatter for all groups.
+- Why: once full depth-7 vector scatter tied at `1063`, the next realistic structural follow-up was to see whether only part of depth `7` wants vector scatter rather than forcing the same VALU tradeoff on all 32 groups.
+- Result:
+- No subset beat `1063`, but the surface is much flatter than expected:
+- `59` single-step subset points still land at `1063`.
+- Best measured point:
+- `depth7 groups = all except {23}` -> `1063`, pass, `11706 ops`, `load=1991`, `flow=798`, `alu=11916`, `valu=6005`, peak scratch `1498/1536`.
+- Other tied examples:
+- full depth-7 vector scatter -> `1063`, `11700 ops`, `alu=11924`, `valu=6004`.
+- depth7 one-group subsets like `{12}` or `{18}` -> `1063`, `11886 ops`, `alu=11924`, `valu=6004`.
+- Decision: keep the checked-in default unchanged. Use the new depth-7 subset plateau as the next search surface; the natural follow-up is 2-group removals around the best single-removal points.
+
+- 2026-03-06: Tried to extend the new `{6,7}` vector-scatter tie family to depth `8`.
+- What changed/tested:
+- Starting from the strongest tied foundation (`g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + SCATTER_VECTOR_XOR_DEPTHS={6,7}`), added depth `8` to the vector-scatter path with three placements:
+- depth `8` plain, depth `6` write-to-values
+- depth `8` write-to-values
+- depth `8` inplace, depth `6` write-to-values
+- Why: once depths `{6,7}` tied at a materially lower-op / lower-ALU point, the next natural question was whether the same family could absorb one more adjacent deep depth and finally convert the static improvement into a cycle win.
+- Result:
+- Baseline tie-family re-check -> `1063`, pass, `11700 ops`, `load=1991`, `flow=798`, `alu=11924`, `valu=6004`, peak scratch `1498/1536`.
+- All tested `{6,7,8}` variants -> `1065`, pass, `11508 ops`, `load=1991`, `flow=798`, `alu=11852`, `valu=6013`, peak scratch `1489/1536`.
+- Decision: keep `{6,7}` as the deepest competitive vector-scatter family currently known. Treat depth `8` extension as another VALU-limited dead end.
+
+- 2026-03-06: Crossed the new `{6,7}` vector-scatter family with the known `1063` mask winners and setup companion.
+- What changed/tested:
+- Evaluated the four known round-4 `1063` single-group winners (`g=13/16/19/14`) under:
+- baseline depth-6-only vector scatter vs vector scatter on depths `{6,7}`
+- derived input pointer vs `SPECIALIZE_INPUT_VALUES_PTR=True`
+- Why: once depth `{6,7}` vector scatter tied baseline on `g=13`, the next cheapest question was whether one of the equivalent round-4 winners plus the only safe setup companion could turn that tied structural family into either a new `1062` or a clearly better `1063` foundation.
+- Result:
+- No `1062` surfaced.
+- Best tied point:
+- `g=13 + SPECIALIZE_INPUT_VALUES_PTR=True + SCATTER_VECTOR_XOR_DEPTHS={6,7}` -> `1063`, pass, `11700 ops`, `load=1991`, `flow=798`, `alu=11924`, `valu=6004`, peak scratch `1498/1536`.
+- Other notable outcomes:
+- `g=13 + {6,7}` without setup specialization -> `1063`, `alu=11932`, `valu=6003`.
+- `g=14 + {6,7}` also ties at `1063` (`alu=11948`, `valu=6001` with specialization).
+- `g=16 + {6,7}` regresses slightly to `1064`.
+- `g=19 + {6,7}` regresses to `1067`.
+- Decision: keep the checked-in default unchanged for now, but use `g=13 + SPECIALIZE_INPUT_VALUES_PTR + depths {6,7}` as the strongest alternative tie family for the next deep-scatter follow-up.
+
+- 2026-03-06: Targeted deep vector-scatter extension around the `1063` baseline.
+- What changed/tested:
+- Starting from the promoted `1063` default, re-tested small extensions of `SCATTER_VECTOR_XOR_DEPTHS={6}` to adjacent deep rounds while varying whether the extra depth writes back to `values` or stays plain/in-place:
+- depths `{5,6}` with depth `5` plain / write-to-values / inplace
+- depths `{6,7}` with depth `7` plain / write-to-values / inplace
+- Why: fresh telemetry on the current baseline still shows deep scatter as the largest remaining reducible load pool, so the cheapest structural pass was to see whether one more adjacent deep depth can now join the vector-scatter family without reopening the older regressions.
+- Result:
+- Extending vector scatter to depth `5` is still non-competitive:
+- all tested `{5,6}` variants -> `1066`, `11700 ops`, `load=1991`, `flow=798`, `alu=11900`, `valu=6007`, peak scratch `1472/1536`.
+- Extending vector scatter to depth `7` is now baseline-neutral:
+- `{6,7}` plain-at-7 / values-at-6 -> `1063`, pass, `11700 ops`, `load=1991`, `flow=798`, `alu=11932`, `valu=6003`, peak scratch `1498/1536`.
+- `{6,7}` values-at-both -> same `1063` result.
+- `{6,7}` inplace-at-7 / values-at-6 -> same `1063` result.
+- Decision: keep the checked-in default unchanged for now, but treat the `{6,7}` vector-scatter family as the next structural tie-point worth exploring. Depth `5` remains a dead end.
+
+- 2026-03-06: Re-profiled the promoted `1063` baseline with scheduler telemetry.
+- What changed/tested:
+- Ran `python3 tests/submission_tests.py` with `SCHED_TELEMETRY_PATH=artifacts/1063_sched.csv` on the current checked-out default, then summarized defer totals and emitted scatter-op counts by round depth.
+- Why: the prior defer/bottleneck analysis in the journal was mostly from `1065` and older families; before another structural rewrite, it was important to confirm what the current `1063` kernel is actually bottlenecking on.
+- Result:
+- `python3 tests/submission_tests.py` still passes at `1063`.
+- Telemetry defer totals:
+- `defer_load_full=29919`
+- `defer_valu_full=7853`
+- `defer_flow_full=7109`
+- `defer_valu_full_offload_failed=3784`
+- `defer_alu_full=52`
+- Emitted deep scatter decomposition on the promoted default:
+- depth `5`: `256` scalar loads + `256` scalar scatter XORs
+- depth `6`: `256` loads + `32` vector scatter XORs
+- depths `7/8/9/10`: each `256` scalar loads + `256` scalar scatter XORs
+- depth `3`: `120 + 120`; depth `4`: `288 + 288`
+- Decision: keep the current baseline unchanged. Use this as the new guidance for the next structural pass: deep scatter remains the main reducible load pool.
+
+- 2026-03-06: Re-tuned round-specific d3/d4 diff-pair counts on the `1063` baseline.
+- What changed/tested:
+- Ran single-axis sweeps on the current `1063` default for:
+- `DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND[3]` in `0..4`
+- `DEPTH_3_VSELECT_DIFF_PAIRS_BY_ROUND[14]` in `0..4`
+- `DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND[4]` in `0..8`
+- `DEPTH_4_VSELECT_DIFF_PAIRS_BY_ROUND[15]` in `0..8`
+- Why: the new `1063` winner changed the round-4 depth-4 mask, so the next smallest adjacent control surface was whether the old round-specific leaf-lowering counts were now off by a little on the new shallow schedule.
+- Result:
+- All four axes re-confirmed the current defaults as best:
+- `d3_r3=4` -> `1063`, pass.
+- `d3_r14=3` -> `1063`, pass.
+- `d4_r4=3` -> `1063`, pass.
+- `d4_r15=1` -> `1063`, pass.
+- Best near misses:
+- `d4_r15=2` -> `1065`, `alu=11996`, `valu=6008`.
+- `d4_r4=0` or `4` -> `1071`.
+- `d3_r14=2` -> `1075`.
+- `d3_r3=2` -> `1084`.
+- Decision: keep the current diff-pair defaults unchanged. This shallow retune surface appears exhausted on the `1063` family.
+
 - 2026-03-06: Full round-4 swap grid and companion-flag matrix on the `1063` family.
 - What changed/tested:
 - Completed the full one-for-one swap grid on `DEPTH_4_VSELECT_GROUPS_BY_ROUND[4]` around the promoted `g=13` default.
