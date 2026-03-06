@@ -21,9 +21,9 @@
 
 ## Current Baseline
 - Command: `python3 tests/submission_tests.py`
-- Result: `1065` cycles, correctness passing.
-- Kernel stats: `12375 ops`, peak scratch `1528/1536`.
-- Note: the currently checked-out worktree on `2026-03-05` re-validates at this `1065` baseline. Older `1078-1082` entries below are useful historical context from earlier architecture exploration, but they do not describe the present file state.
+- Result: `1064` cycles, correctness passing.
+- Kernel stats: `11893 ops`, peak scratch `1497/1536`.
+- Note: the currently checked-out worktree on `2026-03-06` re-validates at this `1064` baseline. Older `1065-1082` entries below are useful historical context from earlier architecture exploration, but they do not describe the present file state.
 
 ## Findings So Far
 - Tail-only shallow stage-5 fusion is not a safe extension of the wrap-root idea:
@@ -133,6 +133,17 @@
 - New tied family from this pass:
 - guarded ALU offload on the depth-5 writeback combine plus the mixed depth-5/depth-6 vector-scatter layout still only ties at `1065`, but it shifts the static shape to `load=1999`, `flow=786`, `alu=11892-11894`, `valu=6006`.
 - Implication: we now have multiple distinct `1065` architectures with materially lower `load` and `alu` than baseline; the missing win is still overlap, not slot-count blindness.
+- New current best on this branch:
+- a depth-6-only vector-scatter rewrite, combined with `PREFER_FLOW_CONST=True`, forest-pointer specialization plus derived input pointer, wrap-root fusion, full tree/hash/scatter writeback, hash temp reuse, guarded scatter-writeback offload, and `ROUND_GATE_WINDOW_BY_ROUND={5:29}`, is correctness-valid at `1064` cycles.
+- Measured shape at the win:
+- `11894 ops`
+- `load=1999`
+- `flow=786`
+- `alu=11885`
+- `valu=6007`
+- `store=32`
+- peak scratch `1497/1536`
+- Implication: the missing win was not a broad scheduler rewrite after all; the first real break came from moving only depth `6` to the vector-scatter architecture while also using flow-const materialization to keep that family’s load pressure down.
 - The tied floor is now robust across several local variants of the same mixed family:
 - `SPECIALIZE_FOREST_VALUES_PTR + SPECIALIZE_INPUT_VALUES_PTR`
 - `SPECIALIZE_FOREST_VALUES_PTR + DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR`
@@ -141,6 +152,21 @@
 - and even broader `write_to_values` placement across depths `{5,6}`
 - all repeatedly converge to correctness-valid `1065` rather than opening a new win.
 - Implication: the current branch is no longer missing a tiny placement/gate/offload interaction around the mixed vector-scatter family; beating `1065` now likely needs a qualitatively different dependency graph rather than another local perturbation of this one.
+- New narrowly-targeted scheduler lead inside the tied family:
+- the mixed vector-scatter architecture is the only one where a ready load can unlock a large offloadable vector combine with a single final sibling load. That makes a “completion-bonus” load tie-breaker materially different from the previously failed global load bias and full-batch preference.
+- Implication: if any scheduler tweak is still worth testing, it should only prefer ready `*_scat_load_*` ops that are one sibling away from unlocking `*_scat_xor_vec*`, and only inside vector-scatter families.
+- New larger rewrite lead after the scheduler shape dead ends:
+- the runtime ALU offloader can only split a vector op across the current and past cycles, never across future cycles. For a few critical offloadable hash combines, that may be leaving useful ALU headroom stranded even in the strongest mixed family.
+- Implication: explicitly scalarizing selected hash combine ops (stage 1 / stage 5) at the IR level is the next larger rewrite worth trying, because it changes the dependency graph and lets the scheduler place those lane ops over future cycles instead of forcing an all-at-once vector combine.
+- Explicit scalarization of the stage-5 hash combine is not yet a real path:
+- the first implementation produced implausibly low `1000`-cycle schedules, but inspection showed it had accidentally collapsed the emitted hash graph (rounds with only tree + branch/index and no hash ops), and correctness failed with out-of-range tree loads.
+- Implication: treat this as an implementation bug / invalid graph, not as a valid optimization. Reverted the path after measurement.
+- New scheduler-architecture lead from the tied families:
+- the current critical-path priority function only prices `flow` and `load`; `alu` and `valu` contribute zero base cost and affect ordering only indirectly through emit order. That means the scheduler is largely blind to the lower `alu/valu` pressure in the strongest mixed families.
+- Implication: a dynamic engine-cost priority model that includes remaining `alu`, `valu`, `load`, and `flow` pressure is a real rewrite, not a knob tweak, and it directly targets the current “better static bounds, same cycles” problem.
+- The first dynamic engine-cost implementation is invalid:
+- enabling it made even the plain baseline emit/schedule a truncated broken graph (`~6743` ops, scheduler stuck at `35` cycles), so the attempted rewrite is not safe enough to keep.
+- Implication: treat this as a failed implementation attempt, not as a valid performance direction. Revert and revisit only if we re-derive the scheduler rewrite more carefully.
 - Chunked deep-round tiling is now ruled out for this branch:
 - even when restricted to one deep round (`5` or `6`) or aimed at the public `group≈17 / round_tile≈13` style, round-major tiling inside concurrency-sized chunks regressed heavily (`1086+`, often `1090+`).
 - Implication: the strongest remaining families still want group-major emission, even when the deep rounds themselves are rewritten.
@@ -165,6 +191,69 @@
 - Decision: stop brute-force knob tuning and focus on architectural changes.
 
 ## Attempt Log
+- 2026-03-06: First correctness-valid break below `1065`.
+- What changed/tested:
+- Tested a depth-6-only vector-scatter family with:
+- `PREFER_FLOW_CONST=True`
+- `SPECIALIZE_FOREST_VALUES_PTR=True`
+- `DERIVE_INPUT_VALUES_PTR_FROM_FOREST_PTR=True`
+- `SCATTER_VECTOR_XOR=True`
+- `SCATTER_VECTOR_XOR_DEPTHS={6}`
+- `SCATTER_VECTOR_XOR_WRITE_TO_VALUES=True`
+- `SCATTER_VECTOR_XOR_WRITE_TO_VALUES_DEPTHS={6}`
+- `ENABLE_WRAP_ROOT_STAGE5_FUSION=True`
+- `ENABLE_INPLACE_TREE_XOR_DATAFLOW=True`
+- `ENABLE_INPLACE_HASH_DATAFLOW=True`
+- `ENABLE_INPLACE_SCALAR_SCATTER_TO_VALUES=True`
+- `REUSE_HASH_COMBINE_TEMPS=True`
+- `ALLOW_OFFLOAD_SCATTER_VEC_WRITEBACK=True`
+- `ROUND_GATE_WINDOW_BY_ROUND={5:29}`
+- Why: after the mixed depth-5/6 family locally exhausted at `1065`, the next hypothesis was that depth `6` alone might be the right place to spend vector-scatter VALU while `PREFER_FLOW_CONST` relieves the tied family’s remaining load pressure.
+- Result:
+- correctness pass across repeated submission-style runs at `1064` cycles.
+- `11894 ops`, slots `load=1999`, `flow=786`, `alu=11885`, `valu=6007`, `store=32`, peak scratch `1497/1536`.
+- Follow-up local variants:
+- `ROUND_GATE_WINDOW_BY_ROUND={5:28}` -> `1064`, `11895 ops`, `alu=11886`, `valu=6007`.
+- `ROUND_GATE_WINDOW_BY_ROUND={5:29}` -> `1064`, `11894 ops`, `alu=11885`, `valu=6007`.
+- `ROUND_GATE_WINDOW_BY_ROUND={5:30}` -> `1064`, `11893 ops`, `alu=11884`, `valu=6007`.
+- `ROUND_GATE_WINDOW_BY_ROUND={5:27}` -> `1067`.
+- `ROUND_GATE_WINDOW_BY_ROUND={5:31}` -> `1066`.
+- Decision: promote the `gate {5:30}` variant as new default. It is correctness-valid, stable, and the lowest-op / lowest-ALU point in the local winner band.
+
+- 2026-03-06: Dynamic engine-cost scheduler rewrite.
+- What changed/tested:
+- Added `DYNAMIC_ENGINE_COSTS` so critical-path priorities could be weighted by remaining per-engine pressure for `alu`, `valu`, `load`, and `flow` instead of the old fixed flow/load-only heuristic.
+- Why: the strongest mixed families already have materially better static `alu/load` bounds than baseline but still tie at `1065`, so the scheduler being blind to `alu/valu` pressure looked like a plausible explanation.
+- Result:
+- The implementation was invalid.
+- Plain baseline with `DYNAMIC_ENGINE_COSTS=True` emitted/scheduled a truncated broken graph (`6743` ops, stuck at `35` cycles).
+- The strongest mixed family also emitted a clearly invalid graph (`6102` ops, `999` cycles).
+- Decision: revert / keep disabled. This rewrite needs a clean re-derivation before it can be trusted.
+
+- 2026-03-06: Invalid current-branch retests of old setup/load-shift scaffolds.
+- What changed/tested:
+- Re-tested on the current branch:
+- `USE_IMMEDIATE_GROUP_LOAD_ADDR=True`
+- `CONST_NONZERO_ENGINE='flow'`
+- `PREFER_FLOW_CONST=True`
+- on or near the strongest mixed family.
+- Why: the mixed family finally reduced scratch and `load`, so these older setup/load-shift scaffolds were worth a direct re-check in the new architecture context.
+- Result:
+- All three paths produced obviously invalid / broken graphs on the current branch state rather than meaningful measurements:
+- `USE_IMMEDIATE_GROUP_LOAD_ADDR=True` on the mixed family -> apparent `1000`-cycle schedule from a truncated `6070`-op graph.
+- `CONST_NONZERO_ENGINE='flow'` on the mixed family -> apparent `1001` from a truncated `6102`-op graph.
+- `PREFER_FLOW_CONST=True` on the mixed family -> apparent `1000` from a truncated `6102`-op graph.
+- Decision: do not trust these as optimization results. Treat them as invalid under the current branch’s experimental scaffolds unless re-derived and re-validated carefully.
+
+- 2026-03-06: Explicit scalarization of stage-5 hash combine on the mixed family.
+- What changed/tested:
+- Added a depth-gated path to scalarize the stage-5 hash combine into eight lane-wise ALU XORs on the strongest mixed family.
+- Why: the runtime offloader can only split vector combines across current/past cycles, so this rewrite was intended to let the scheduler spread the final hash combine across future cycles.
+- Result:
+- The implementation was invalid.
+- It appeared to produce `1000`-cycle schedules, but inspection showed round hashes had disappeared from the emitted graph entirely (`hash_count = 0`), and a correctness run failed with out-of-range tree loads.
+- Decision: reverted. Treat as an implementation bug, not a valid optimization.
+
 - 2026-03-06: Narrowing the tied mixed vector-scatter family.
 - What changed/tested:
 - Started from the tied mixed family:
